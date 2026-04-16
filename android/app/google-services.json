@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "776408358854",
+    "project_id": "barbecuez-project",
+    "storage_bucket": "barbecuez-project.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:776408358854:android:aea8cd636e61a05a789cc7",
+        "android_client_info": {
+          "package_name": "com.proteams.barbecuez"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDH2KtizwgwRwuFKiz30qcgfiUrBU1OTHQ"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
