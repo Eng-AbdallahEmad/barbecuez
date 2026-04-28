@@ -11,7 +11,6 @@ import 'package:onesignal_flutter/onesignal_flutter.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../main.dart'; // for localNotifications & androidChannel
-import 'about_screen.dart';
 import 'tracking_service.dart';
 
 // ─── Tab config ───────────────────────────────────────────────────────────────
@@ -31,8 +30,7 @@ class _TabConfig {
 const List<_TabConfig> _tabs = [
   _TabConfig(label: 'Home',   icon: Icons.home_outlined,           url: 'https://barbecuez.no'),
   _TabConfig(label: 'Menu',   icon: Icons.restaurant_menu_outlined, url: 'https://barbecuez.no/menu'),
-  _TabConfig(label: 'Orders', icon: Icons.receipt_long_outlined,   url: 'https://barbecuez.no/order-tracking'),
-  _TabConfig(label: 'About',  icon: Icons.info_outline,            url: ''),  // Native screen — no URL
+  _TabConfig(label: 'Contact', icon: Icons.info_outline,   url: 'https://barbecuez.no/contact'),
 ];
 
 // ─── MainScreen (Native Tab Shell) ────────────────────────────────────────────
@@ -62,9 +60,6 @@ class _MainScreenState extends State<MainScreen> {
 
   final String allowedDomain = "barbecuez.no";
   DateTime? _lastBackPressed;
-
-  // Orders badge count (Native feature — Apple loves this)
-  int _ordersBadge = 0;
 
   @override
   void initState() {
@@ -111,15 +106,15 @@ class _MainScreenState extends State<MainScreen> {
         uri.host == allowedDomain || uri.host == 'www.$allowedDomain';
     if (!isBarbecuezDomain) return;
 
-    // Switch to Orders tab if it's an order-tracking link
+    // Order tracking → open in Home tab
     if (uri.path == '/order-tracking') {
       final orderNumber = uri.queryParameters['order'];
       final targetUrl = (orderNumber != null && orderNumber.isNotEmpty)
           ? 'https://$allowedDomain/order-tracking?order=$orderNumber'
           : 'https://$allowedDomain/order-tracking';
 
-      _switchToTab(2); // Orders tab index
-      await _loadUrlInTab(2, targetUrl);
+      _switchToTab(0);
+      await _loadUrlInTab(0, targetUrl);
       return;
     }
 
@@ -139,16 +134,45 @@ class _MainScreenState extends State<MainScreen> {
     if (mounted) setState(() => _currentIndex = index);
   }
 
-  // Reset Orders tab back to its default URL (called when leaving the tab)
-  Future<void> _resetOrdersTab() async {
+  // Reset Contact tab back to its default URL (called when leaving the tab)
+  Future<void> _resetContactTab() async {
     final controller = _webControllers[2];
     if (controller != null) {
       await controller.loadUrl(
         urlRequest: URLRequest(url: WebUri(_tabs[2].url)),
       );
     } else {
-      _currentUrls[2] = null; // will use default URL on next mount
+      _currentUrls[2] = null;
     }
+  }
+
+  // Copy localStorage from Home WebView to another tab so tracking banner persists
+  Future<void> _syncLocalStorageToController(InAppWebViewController controller) async {
+    final homeController = _webControllers[0];
+    if (homeController == null) return;
+
+    final storageJson = await homeController.evaluateJavascript(source: '''
+      (function() {
+        var d = {};
+        for (var i = 0; i < localStorage.length; i++) {
+          var k = localStorage.key(i);
+          d[k] = localStorage.getItem(k);
+        }
+        return JSON.stringify(d);
+      })()
+    ''');
+
+    if (storageJson == null || storageJson == 'null' || storageJson == '"{}"' || storageJson == '{}') return;
+
+    await controller.evaluateJavascript(source: '''
+      (function(json) {
+        try {
+          var d = JSON.parse(json);
+          Object.keys(d).forEach(function(k) { localStorage.setItem(k, d[k]); });
+          window.dispatchEvent(new Event('storage'));
+        } catch(e) {}
+      })($storageJson);
+    ''');
   }
 
   Future<void> _loadUrlInTab(int tabIndex, String url) async {
@@ -226,11 +250,6 @@ class _MainScreenState extends State<MainScreen> {
     FirebaseMessaging.onMessage.listen((RemoteMessage message) async {
       final notification = message.notification;
       if (notification != null) {
-        // Bump badge on Orders tab if it's an order notification
-        if (message.data['type'] == 'order') {
-          if (mounted) setState(() => _ordersBadge++);
-        }
-
         await localNotifications.show(
           id: notification.hashCode,
           title: notification.title ?? 'Barbecuez',
@@ -243,6 +262,11 @@ class _MainScreenState extends State<MainScreen> {
               importance: Importance.high,
               priority: Priority.high,
               icon: '@mipmap/launcher_icon',
+            ),
+            iOS: const DarwinNotificationDetails(
+              presentAlert: true,
+              presentBadge: true,
+              presentSound: true,
             ),
           ),
           payload: message.data['url'],
@@ -275,10 +299,8 @@ class _MainScreenState extends State<MainScreen> {
       return;
     }
 
-    // If not on Home tab → go to Home tab + reset Orders if leaving it
     if (_currentIndex != 0) {
-      if (_currentIndex == 2) await _resetOrdersTab();
-      // About tab (3) → just go Home, no reset needed
+      if (_currentIndex == 2) await _resetContactTab();
       setState(() => _currentIndex = 0);
       return;
     }
@@ -326,10 +348,7 @@ class _MainScreenState extends State<MainScreen> {
         body: SafeArea(
           child: IndexedStack(
             index: _currentIndex,
-            children: [
-              ...List.generate(_tabs.length - 1, (i) => _buildTab(i)),
-              const AboutScreen(), // Tab 3 — fully native, no WebView
-            ],
+            children: List.generate(_tabs.length, (i) => _buildTab(i)),
           ),
         ),
 
@@ -337,13 +356,8 @@ class _MainScreenState extends State<MainScreen> {
         bottomNavigationBar: BottomNavigationBar(
           currentIndex: _currentIndex,
           onTap: (index) {
-            // When leaving Orders tab → reset it to default URL
             if (_currentIndex == 2 && index != 2) {
-              _resetOrdersTab();
-            }
-            // Clear badge when user taps Orders tab
-            if (index == 2 && _ordersBadge > 0) {
-              setState(() => _ordersBadge = 0);
+              _resetContactTab();
             }
             setState(() => _currentIndex = index);
           },
@@ -362,16 +376,8 @@ class _MainScreenState extends State<MainScreen> {
     );
   }
 
-  // Badge icon for Orders tab — native feature Apple looks for
   Widget _buildTabIcon(int index) {
-    final icon = Icon(_tabs[index].icon);
-    if (index == 2 && _ordersBadge > 0) {
-      return Badge(
-        label: Text('$_ordersBadge'),
-        child: icon,
-      );
-    }
-    return icon;
+    return Icon(_tabs[index].icon);
   }
 
   // ─── Individual tab WebView ──────────────────────────────────────────────────
@@ -401,6 +407,10 @@ class _MainScreenState extends State<MainScreen> {
             );
           },
           onLoadStop: (controller, url) async {
+            // Sync localStorage from Home tab so order-tracking banner shows on all tabs
+            if (index != 0) {
+              await _syncLocalStorageToController(controller);
+            }
             await _injectPlayerIdToController(controller);
             await _tryFetchAndInjectPlayerId();
           },
