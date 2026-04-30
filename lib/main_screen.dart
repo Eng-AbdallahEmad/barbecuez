@@ -146,7 +146,9 @@ class _MainScreenState extends State<MainScreen> {
     }
   }
 
-  // Copy localStorage from Home WebView to another tab so tracking banner persists
+  // Sync localStorage from Home WebView to another WebView and fire StorageEvents
+  // so the website's tracking component re-checks for active orders.
+  // Must be called both on page load AND when the user switches tabs.
   Future<void> _syncLocalStorageToController(InAppWebViewController controller) async {
     final homeController = _webControllers[0];
     if (homeController == null) return;
@@ -162,14 +164,36 @@ class _MainScreenState extends State<MainScreen> {
       })()
     ''');
 
-    if (storageJson == null || storageJson == 'null' || storageJson == '"{}"' || storageJson == '{}') return;
+    if (storageJson == null || storageJson == 'null') return;
 
+    // Write each key and fire a proper StorageEvent so website listeners pick it up
     await controller.evaluateJavascript(source: '''
       (function(json) {
         try {
           var d = JSON.parse(json);
-          Object.keys(d).forEach(function(k) { localStorage.setItem(k, d[k]); });
-          window.dispatchEvent(new Event('storage'));
+          if (!d || Object.keys(d).length === 0) return;
+          Object.keys(d).forEach(function(k) {
+            var oldVal = localStorage.getItem(k);
+            var newVal = d[k];
+            localStorage.setItem(k, newVal);
+            if (oldVal !== newVal) {
+              try {
+                window.dispatchEvent(new StorageEvent('storage', {
+                  key: k,
+                  oldValue: oldVal,
+                  newValue: newVal,
+                  url: window.location.href,
+                  storageArea: window.localStorage
+                }));
+              } catch(e) {}
+            }
+          });
+          // Broadcast a null-key StorageEvent so listeners that watch all changes fire
+          window.dispatchEvent(new StorageEvent('storage', {
+            key: null,
+            url: window.location.href,
+            storageArea: window.localStorage
+          }));
         } catch(e) {}
       })($storageJson);
     ''');
@@ -355,11 +379,20 @@ class _MainScreenState extends State<MainScreen> {
         // ── Native Bottom Navigation Bar ──────────────────────────────────
         bottomNavigationBar: BottomNavigationBar(
           currentIndex: _currentIndex,
-          onTap: (index) {
+          onTap: (index) async {
             if (_currentIndex == 2 && index != 2) {
               _resetContactTab();
             }
             setState(() => _currentIndex = index);
+            // When switching to any non-Home tab, re-sync localStorage so the
+            // tracking banner reflects current order state (WebViews don't
+            // share JS context, so the banner JS won't re-run on tab switch).
+            if (index != 0) {
+              final controller = _webControllers[index];
+              if (controller != null) {
+                await _syncLocalStorageToController(controller);
+              }
+            }
           },
           selectedItemColor: Colors.red[900],
           unselectedItemColor: Colors.grey,
