@@ -208,11 +208,18 @@ class _OnboardingScreenState extends State<OnboardingScreen>
   Future<void> _finishOnboarding() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool('onboarding_done', true);
+
+    // ← NEW: نشوف لو فيه pending deep link
+    final pendingUrl = prefs.getString('pending_deep_link');
+    if (pendingUrl != null) {
+      await prefs.remove('pending_deep_link');
+    }
+
     if (!mounted) return;
     Navigator.of(context).pushReplacement(
       PageRouteBuilder(
         transitionDuration: const Duration(milliseconds: 600),
-        pageBuilder: (_, __, ___) => const MainScreen(),
+        pageBuilder: (_, __, ___) => MainScreen(initialUrl: pendingUrl), // ← NEW
         transitionsBuilder: (_, anim, __, child) => FadeTransition(
           opacity: CurvedAnimation(parent: anim, curve: Curves.easeIn),
           child: child,

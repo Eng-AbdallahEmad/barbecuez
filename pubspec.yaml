@@ -49,6 +49,7 @@ dependencies:
   app_links: ^6.3.3
   shared_preferences: ^2.2.3
   app_tracking_transparency: ^2.0.4
+  flutter_secure_storage: ^10.0.0
 
 dev_dependencies:
   flutter_test:
