@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:app_links/app_links.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
@@ -8,10 +9,11 @@ import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:fluttertoast/fluttertoast.dart';
 import 'package:onesignal_flutter/onesignal_flutter.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 
-import '../main.dart'; // for localNotifications & androidChannel
-import 'tracking_service.dart';
+import '../main.dart';
+import '../services/tracking_token_store.dart';
 
 // ─── Tab config ───────────────────────────────────────────────────────────────
 
@@ -36,13 +38,20 @@ const List<_TabConfig> _tabs = [
 // ─── MainScreen (Native Tab Shell) ────────────────────────────────────────────
 
 class MainScreen extends StatefulWidget {
-  const MainScreen({super.key});
+  final String? initialUrl;
+
+  const MainScreen({super.key, this.initialUrl});
 
   @override
   State<MainScreen> createState() => _MainScreenState();
 }
 
-class _MainScreenState extends State<MainScreen> {
+class _MainScreenState extends State<MainScreen>
+    with AutomaticKeepAliveClientMixin, WidgetsBindingObserver {
+
+  @override
+  bool get wantKeepAlive => true;
+
   int _currentIndex = 0;
 
   // One controller slot per tab — filled lazily on first visit
@@ -61,16 +70,21 @@ class _MainScreenState extends State<MainScreen> {
   final String allowedDomain = "barbecuez.no";
   DateTime? _lastBackPressed;
 
+  static const String _lastUrlKey = 'last_url';
+
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+
+    // Handle pending deep link from cold start
+    _handlePendingDeepLink();
+
     _initFirebaseNotifications();
     _initOneSignal();
     _initDeepLinks();
-    // Request ATT permission on iOS before WebViews load
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      TrackingService.requestPermissionIfNeeded(context);
-    });
+
+    onNotificationDeepLink = _handleIncomingLink;
 
     _playerIdRetryTimer = Timer.periodic(const Duration(seconds: 3), (_) {
       _tryFetchAndInjectPlayerId();
@@ -79,9 +93,65 @@ class _MainScreenState extends State<MainScreen> {
 
   @override
   void dispose() {
+    if (onNotificationDeepLink == _handleIncomingLink) {
+      onNotificationDeepLink = null;
+    }
+    WidgetsBinding.instance.removeObserver(this);
     _playerIdRetryTimer?.cancel();
     _appLinksSub?.cancel();
     super.dispose();
+  }
+
+  // ← NEW: Re-inject tokens when app resumes
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+    if (state == AppLifecycleState.resumed) {
+      for (final controller in _webControllers) {
+        if (controller != null) {
+          _injectTrackingTokens(controller);
+        }
+      }
+    }
+  }
+
+  // ← NEW: Handle pending deep link from SharedPreferences
+  Future<void> _handlePendingDeepLink() async {
+    final prefs = await SharedPreferences.getInstance();
+    final pendingUrl = prefs.getString('pending_deep_link');
+    if (pendingUrl != null && pendingUrl.isNotEmpty) {
+      await prefs.remove('pending_deep_link');
+      // Parse and handle immediately
+      await _handleIncomingLink(Uri.parse(pendingUrl));
+    }
+  }
+
+  // ─── Tracking tokens ────────────────────────────────────────────────────────
+
+  Future<void> _injectTrackingTokens(InAppWebViewController controller) async {
+    try {
+      final tokens = await TrackingTokenStore.readAll();
+      if (tokens.isEmpty) {
+        debugPrint('📭 No tracking tokens to inject');
+        return;
+      }
+      final json = jsonEncode(tokens);
+      await controller.evaluateJavascript(source: '''
+        (function() {
+          if (window.__setTrackingTokens) {
+            window.__setTrackingTokens($json);
+            console.log('✅ Restored ' + Object.keys($json).length + ' tracking tokens from native');
+          } else {
+            setTimeout(function() {
+              if (window.__setTrackingTokens) window.__setTrackingTokens($json);
+            }, 500);
+          }
+        })();
+      ''');
+      debugPrint('📤 Injected ${tokens.length} tokens');
+    } catch (e) {
+      debugPrint('❌ Token injection error: $e');
+    }
   }
 
   // ─── Deep Links ─────────────────────────────────────────────────────────────
@@ -106,12 +176,29 @@ class _MainScreenState extends State<MainScreen> {
         uri.host == allowedDomain || uri.host == 'www.$allowedDomain';
     if (!isBarbecuezDomain) return;
 
-    // Order tracking → open in Home tab
+    // Order tracking → open in Home tab with token
     if (uri.path == '/order-tracking') {
       final orderNumber = uri.queryParameters['order'];
-      final targetUrl = (orderNumber != null && orderNumber.isNotEmpty)
-          ? 'https://$allowedDomain/order-tracking?order=$orderNumber'
-          : 'https://$allowedDomain/order-tracking';
+      final token = uri.queryParameters['tt'];
+
+      // Save token if present
+      if (orderNumber != null && token != null && token.isNotEmpty) {
+        await TrackingTokenStore.set(orderNumber, token);
+        debugPrint("💾 Token saved from deep link: $orderNumber");
+      }
+
+      // Build URL with token for instant loading
+      String targetUrl = 'https://$allowedDomain/order-tracking';
+      if (orderNumber != null && orderNumber.isNotEmpty) {
+        final savedToken = await TrackingTokenStore.get(orderNumber);
+        if (savedToken != null && savedToken.isNotEmpty) {
+          targetUrl = 'https://$allowedDomain/order-tracking?order=$orderNumber&tt=$savedToken';
+          debugPrint("🚀 FAST: Opening tracking with token: $targetUrl");
+        } else {
+          targetUrl = 'https://$allowedDomain/order-tracking?order=$orderNumber';
+          debugPrint("⚠️ No token found for: $orderNumber");
+        }
+      }
 
       _switchToTab(0);
       await _loadUrlInTab(0, targetUrl);
@@ -134,21 +221,19 @@ class _MainScreenState extends State<MainScreen> {
     if (mounted) setState(() => _currentIndex = index);
   }
 
-  // Reset Contact tab back to its default URL (called when leaving the tab)
-  Future<void> _resetContactTab() async {
-    final controller = _webControllers[2];
+  // ← NEW: Reset any tab to its original URL
+  Future<void> _resetTab(int index) async {
+    final controller = _webControllers[index];
     if (controller != null) {
       await controller.loadUrl(
-        urlRequest: URLRequest(url: WebUri(_tabs[2].url)),
+        urlRequest: URLRequest(url: WebUri(_tabs[index].url)),
       );
     } else {
-      _currentUrls[2] = null;
+      _currentUrls[index] = null;
     }
   }
 
-  // Sync localStorage from Home WebView to another WebView and fire StorageEvents
-  // so the website's tracking component re-checks for active orders.
-  // Must be called both on page load AND when the user switches tabs.
+  // Sync localStorage from Home WebView to another WebView
   Future<void> _syncLocalStorageToController(InAppWebViewController controller) async {
     final homeController = _webControllers[0];
     if (homeController == null) return;
@@ -166,7 +251,6 @@ class _MainScreenState extends State<MainScreen> {
 
     if (storageJson == null || storageJson == 'null') return;
 
-    // Write each key and fire a proper StorageEvent so website listeners pick it up
     await controller.evaluateJavascript(source: '''
       (function(json) {
         try {
@@ -188,7 +272,6 @@ class _MainScreenState extends State<MainScreen> {
               } catch(e) {}
             }
           });
-          // Broadcast a null-key StorageEvent so listeners that watch all changes fire
           window.dispatchEvent(new StorageEvent('storage', {
             key: null,
             url: window.location.href,
@@ -204,7 +287,6 @@ class _MainScreenState extends State<MainScreen> {
     if (controller != null) {
       await controller.loadUrl(urlRequest: URLRequest(url: WebUri(url)));
     } else {
-      // Tab not mounted yet — store URL so it loads when tab opens
       _currentUrls[tabIndex] = url;
     }
   }
@@ -257,6 +339,43 @@ class _MainScreenState extends State<MainScreen> {
       }
     });
 
+    // Re-route OneSignal foreground notifications through flutter_local_notifications
+    // so they use our dismissible channel (autoCancel=true, ongoing=false).
+    OneSignal.Notifications.addForegroundWillDisplayListener((event) async {
+      try {
+        event.preventDefault();
+        final n = event.notification;
+        final url = (n.additionalData?['url'] as String?) ?? n.launchUrl;
+        await localNotifications.show(
+          id: n.notificationId.hashCode,
+          title: n.title ?? 'Barbecuez',
+          body: n.body ?? '',
+          notificationDetails: NotificationDetails(
+            android: AndroidNotificationDetails(
+              androidChannel.id,
+              androidChannel.name,
+              channelDescription: androidChannel.description,
+              importance: Importance.high,
+              priority: Priority.high,
+              icon: '@mipmap/launcher_icon',
+              autoCancel: true,
+              ongoing: false,
+              onlyAlertOnce: false,
+              fullScreenIntent: false,
+            ),
+            iOS: const DarwinNotificationDetails(
+              presentAlert: true,
+              presentBadge: true,
+              presentSound: true,
+            ),
+          ),
+          payload: url,
+        );
+      } catch (e) {
+        debugPrint('OneSignal foreground re-display error: $e');
+      }
+    });
+
     OneSignal.Notifications.addClickListener((event) async {
       final url = event.notification.additionalData?['url'] as String?;
       if (url != null && url.isNotEmpty) {
@@ -286,6 +405,10 @@ class _MainScreenState extends State<MainScreen> {
               importance: Importance.high,
               priority: Priority.high,
               icon: '@mipmap/launcher_icon',
+              autoCancel: true,
+              ongoing: false,
+              onlyAlertOnce: false,
+              fullScreenIntent: false,
             ),
             iOS: const DarwinNotificationDetails(
               presentAlert: true,
@@ -324,7 +447,7 @@ class _MainScreenState extends State<MainScreen> {
     }
 
     if (_currentIndex != 0) {
-      if (_currentIndex == 2) await _resetContactTab();
+      _resetTab(_currentIndex); // ← Reset current tab before leaving
       setState(() => _currentIndex = 0);
       return;
     }
@@ -355,11 +478,10 @@ class _MainScreenState extends State<MainScreen> {
 
   @override
   Widget build(BuildContext context) {
-    // White status bar + dark icons on all screens
     SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
       statusBarColor: Colors.white,
-      statusBarIconBrightness: Brightness.dark,  // Android
-      statusBarBrightness: Brightness.light,      // iOS
+      statusBarIconBrightness: Brightness.dark,
+      statusBarBrightness: Brightness.light,
     ));
 
     return PopScope(
@@ -375,18 +497,20 @@ class _MainScreenState extends State<MainScreen> {
             children: List.generate(_tabs.length, (i) => _buildTab(i)),
           ),
         ),
-
-        // ── Native Bottom Navigation Bar ──────────────────────────────────
         bottomNavigationBar: BottomNavigationBar(
           currentIndex: _currentIndex,
           onTap: (index) async {
-            if (_currentIndex == 2 && index != 2) {
-              _resetContactTab();
+            // ← NEW: If tapping same tab again, reset to original URL
+            if (_currentIndex == index) {
+              await _resetTab(index);
+              return;
             }
+
+            // ← NEW: Reset current tab before switching to new tab
+            await _resetTab(_currentIndex);
+
             setState(() => _currentIndex = index);
-            // When switching to any non-Home tab, re-sync localStorage so the
-            // tracking banner reflects current order state (WebViews don't
-            // share JS context, so the banner JS won't re-run on tab switch).
+
             if (index != 0) {
               final controller = _webControllers[index];
               if (controller != null) {
@@ -400,17 +524,13 @@ class _MainScreenState extends State<MainScreen> {
           items: [
             for (int i = 0; i < _tabs.length; i++)
               BottomNavigationBarItem(
-                icon: _buildTabIcon(i),
+                icon: Icon(_tabs[i].icon),
                 label: _tabs[i].label,
               ),
           ],
         ),
       ),
     );
-  }
-
-  Widget _buildTabIcon(int index) {
-    return Icon(_tabs[index].icon);
   }
 
   // ─── Individual tab WebView ──────────────────────────────────────────────────
@@ -431,21 +551,65 @@ class _MainScreenState extends State<MainScreen> {
             useHybridComposition: true,
             mixedContentMode: MixedContentMode.MIXED_CONTENT_NEVER_ALLOW,
             geolocationEnabled: true,
+            domStorageEnabled: true,
+            databaseEnabled: true,
+            cacheEnabled: true,
+            thirdPartyCookiesEnabled: true,
+            incognito: false,
+            cacheMode: CacheMode.LOAD_DEFAULT,
           ),
           onWebViewCreated: (controller) {
             _webControllers[index] = controller;
+
+            // Handler 1: OneSignal Player ID
             controller.addJavaScriptHandler(
               handlerName: 'getOneSignalPlayerId',
               callback: (_) => _oneSignalPlayerId ?? '',
             );
+
+            // Handler 2: Site requests token
+            controller.addJavaScriptHandler(
+              handlerName: 'getTrackingToken',
+              callback: (args) async {
+                if (args.isEmpty) return null;
+                final orderNumber = args[0]?.toString() ?? '';
+                if (orderNumber.isEmpty) return null;
+                final token = await TrackingTokenStore.get(orderNumber);
+                debugPrint('🔑 getTrackingToken($orderNumber) -> ${token != null ? "FOUND" : "MISSING"}');
+                return token;
+              },
+            );
+
+            // Handler 3: Site saves new token
+            controller.addJavaScriptHandler(
+              handlerName: 'persistTrackingToken',
+              callback: (args) async {
+                if (args.length < 2) return {'success': false};
+                final orderNumber = args[0]?.toString() ?? '';
+                final token = args[1]?.toString() ?? '';
+                await TrackingTokenStore.set(orderNumber, token);
+                debugPrint('💾 persistTrackingToken($orderNumber) saved');
+                return {'success': true};
+              },
+            );
+
+            // Preload tokens immediately
+            _injectTrackingTokens(controller);
+          },
+          onLoadStart: (controller, url) async {
+            // Early injection
+            if (controller != null) {
+              await _injectTrackingTokens(controller);
+            }
           },
           onLoadStop: (controller, url) async {
-            // Sync localStorage from Home tab so order-tracking banner shows on all tabs
+            // Sync localStorage from Home tab
             if (index != 0) {
               await _syncLocalStorageToController(controller);
             }
             await _injectPlayerIdToController(controller);
             await _tryFetchAndInjectPlayerId();
+            await _injectTrackingTokens(controller);
           },
           onGeolocationPermissionsShowPrompt: (controller, origin) async {
             return GeolocationPermissionShowPromptResponse(
@@ -459,7 +623,7 @@ class _MainScreenState extends State<MainScreen> {
             if (uri == null) return NavigationActionPolicy.ALLOW;
             if (!navigationAction.isForMainFrame) return NavigationActionPolicy.ALLOW;
 
-            // If Orders tab tries to navigate to home → switch to Home tab instead
+            // If Orders tab tries to navigate to home → switch to Home tab
             if (index == 2) {
               final path = uri.path;
               final isHomePage = (path == '/' || path.isEmpty) &&
