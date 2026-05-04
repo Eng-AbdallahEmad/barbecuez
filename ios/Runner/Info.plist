@@ -40,6 +40,11 @@
     <string>We send push notifications to update you on your order status and confirmations.</string>
     <key>NSUserTrackingUsageDescription</key>
     <string>We use cookies to keep you logged in and improve your experience.</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>fetch</string>
+		<string>remote-notification</string>
+	</array>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

@@ -2,7 +2,6 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:app_links/app_links.dart';
-import 'package:barbecuez/services/tracking_token_store.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -14,6 +13,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../main.dart';
+import '../services/tracking_token_store.dart';
 
 // ─── Tab config ───────────────────────────────────────────────────────────────
 
@@ -84,6 +84,8 @@ class _MainScreenState extends State<MainScreen>
     _initOneSignal();
     _initDeepLinks();
 
+    onNotificationDeepLink = _handleIncomingLink;
+
     _playerIdRetryTimer = Timer.periodic(const Duration(seconds: 3), (_) {
       _tryFetchAndInjectPlayerId();
     });
@@ -91,6 +93,9 @@ class _MainScreenState extends State<MainScreen>
 
   @override
   void dispose() {
+    if (onNotificationDeepLink == _handleIncomingLink) {
+      onNotificationDeepLink = null;
+    }
     WidgetsBinding.instance.removeObserver(this);
     _playerIdRetryTimer?.cancel();
     _appLinksSub?.cancel();
@@ -334,6 +339,43 @@ class _MainScreenState extends State<MainScreen>
       }
     });
 
+    // Re-route OneSignal foreground notifications through flutter_local_notifications
+    // so they use our dismissible channel (autoCancel=true, ongoing=false).
+    OneSignal.Notifications.addForegroundWillDisplayListener((event) async {
+      try {
+        event.preventDefault();
+        final n = event.notification;
+        final url = (n.additionalData?['url'] as String?) ?? n.launchUrl;
+        await localNotifications.show(
+          id: n.notificationId.hashCode,
+          title: n.title ?? 'Barbecuez',
+          body: n.body ?? '',
+          notificationDetails: NotificationDetails(
+            android: AndroidNotificationDetails(
+              androidChannel.id,
+              androidChannel.name,
+              channelDescription: androidChannel.description,
+              importance: Importance.high,
+              priority: Priority.high,
+              icon: '@mipmap/launcher_icon',
+              autoCancel: true,
+              ongoing: false,
+              onlyAlertOnce: false,
+              fullScreenIntent: false,
+            ),
+            iOS: const DarwinNotificationDetails(
+              presentAlert: true,
+              presentBadge: true,
+              presentSound: true,
+            ),
+          ),
+          payload: url,
+        );
+      } catch (e) {
+        debugPrint('OneSignal foreground re-display error: $e');
+      }
+    });
+
     OneSignal.Notifications.addClickListener((event) async {
       final url = event.notification.additionalData?['url'] as String?;
       if (url != null && url.isNotEmpty) {
@@ -363,6 +405,10 @@ class _MainScreenState extends State<MainScreen>
               importance: Importance.high,
               priority: Priority.high,
               icon: '@mipmap/launcher_icon',
+              autoCancel: true,
+              ongoing: false,
+              onlyAlertOnce: false,
+              fullScreenIntent: false,
             ),
             iOS: const DarwinNotificationDetails(
               presentAlert: true,

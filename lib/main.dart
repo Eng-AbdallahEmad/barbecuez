@@ -24,6 +24,9 @@ const AndroidNotificationChannel androidChannel = AndroidNotificationChannel(
   importance: Importance.high,
 );
 
+// Set by MainScreen so notification taps can deep-link into the active controller.
+Future<void> Function(Uri uri)? onNotificationDeepLink;
+
 @pragma('vm:entry-point')
 Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
   await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
@@ -61,7 +64,12 @@ Future<void> main() async {
     onDidReceiveNotificationResponse: (NotificationResponse response) async {
       final payload = response.payload;
       if (payload != null && payload.isNotEmpty) {
-        // handle navigation
+        final handler = onNotificationDeepLink;
+        if (handler != null) {
+          try {
+            await handler(Uri.parse(payload));
+          } catch (_) {}
+        }
       }
     },
   );
