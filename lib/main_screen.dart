@@ -479,9 +479,9 @@ class _MainScreenState extends State<MainScreen>
   @override
   Widget build(BuildContext context) {
     SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
-      statusBarColor: Colors.white,
-      statusBarIconBrightness: Brightness.dark,
-      statusBarBrightness: Brightness.light,
+      statusBarColor: Colors.black,
+      statusBarIconBrightness: Brightness.light,
+      statusBarBrightness: Brightness.dark,
     ));
 
     return PopScope(
@@ -490,7 +490,7 @@ class _MainScreenState extends State<MainScreen>
         if (!didPop) await _handleBackPressed();
       },
       child: Scaffold(
-        backgroundColor: Colors.white,
+        backgroundColor: Colors.black,
         body: SafeArea(
           child: IndexedStack(
             index: _currentIndex,
@@ -498,6 +498,7 @@ class _MainScreenState extends State<MainScreen>
           ),
         ),
         bottomNavigationBar: BottomNavigationBar(
+          backgroundColor: Colors.black,
           currentIndex: _currentIndex,
           onTap: (index) async {
             // ← NEW: If tapping same tab again, reset to original URL
@@ -518,8 +519,8 @@ class _MainScreenState extends State<MainScreen>
               }
             }
           },
-          selectedItemColor: Colors.red[900],
-          unselectedItemColor: Colors.grey,
+          selectedItemColor: Colors.red[700],
+          unselectedItemColor: Colors.grey[600],
           type: BottomNavigationBarType.fixed,
           items: [
             for (int i = 0; i < _tabs.length; i++)

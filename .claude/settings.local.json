@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(dart analyze *)"
+      "Bash(dart analyze *)",
+      "Bash(Get-ChildItem -Recurse -Depth 3)",
+      "Bash(Select-Object FullName)"
     ]
   }
 }
