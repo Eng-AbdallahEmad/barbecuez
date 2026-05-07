@@ -4,11 +4,11 @@ import 'dart:io';
 import 'package:barbecuez/main_screen.dart';
 import 'package:barbecuez/onboarding_screen.dart';
 import 'package:flutter/material.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 
 
 class SplashScreen extends StatefulWidget {
-  const SplashScreen({super.key});
+  final bool onboardingDone;
+  const SplashScreen({super.key, required this.onboardingDone});
 
   @override
   State<SplashScreen> createState() => _SplashScreenState();
@@ -168,15 +168,10 @@ class _SplashScreenState extends State<SplashScreen>
     await Future.delayed(const Duration(milliseconds: 200));
 
     if (!mounted) return;
-
-    final prefs = await SharedPreferences.getInstance();
-    final onboardingDone = prefs.getBool('onboarding_done') ?? false;
-
-    if (!mounted) return;
     Navigator.of(context).pushReplacement(
       PageRouteBuilder(
         transitionDuration: const Duration(milliseconds: 600),
-        pageBuilder: (_, __, ___) => onboardingDone
+        pageBuilder: (_, __, ___) => widget.onboardingDone
             ? const MainScreen()
             : const OnboardingScreen(),
         transitionsBuilder: (_, animation, __, child) {

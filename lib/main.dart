@@ -8,6 +8,7 @@ import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:onesignal_flutter/onesignal_flutter.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'firebase_options.dart';
 import 'splash_screen.dart';
@@ -84,18 +85,22 @@ Future<void> main() async {
 
   await _requestLocationPermission();
 
-  runApp(const MyApp());
+  final prefs = await SharedPreferences.getInstance();
+  final onboardingDone = prefs.getBool('onboarding_done') ?? false;
+
+  runApp(MyApp(onboardingDone: onboardingDone));
 }
 
 class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+  final bool onboardingDone;
+  const MyApp({super.key, required this.onboardingDone});
 
   @override
   Widget build(BuildContext context) {
-    return const MaterialApp(
+    return MaterialApp(
       title: 'Barbecuez',
       debugShowCheckedModeBanner: false,
-      home: SplashScreen(),
+      home: SplashScreen(onboardingDone: onboardingDone),
     );
   }
 }
