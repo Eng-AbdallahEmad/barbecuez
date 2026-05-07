@@ -160,13 +160,20 @@ class _MainScreenState extends State<MainScreen>
     try {
       final Uri? initialUri = await _appLinks.getInitialLink();
       if (initialUri != null) await _handleIncomingLink(initialUri);
-
-      _appLinksSub = _appLinks.uriLinkStream.listen((Uri uri) async {
-        await _handleIncomingLink(uri);
-      });
     } catch (e) {
-      debugPrint("Deep link init error: $e");
+      debugPrint("Deep link getInitialLink error: $e");
     }
+
+    _appLinksSub = _appLinks.uriLinkStream.listen(
+      (Uri uri) async {
+        try {
+          await _handleIncomingLink(uri);
+        } catch (e) {
+          debugPrint("Deep link handle error: $e");
+        }
+      },
+      onError: (e) => debugPrint("Deep link stream error: $e"),
+    );
   }
 
   Future<void> _handleIncomingLink(Uri uri) async {

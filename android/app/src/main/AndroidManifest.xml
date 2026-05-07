@@ -28,26 +28,19 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
 
+            <!-- App Links: barbecuez.no — catch all HTTPS paths -->
             <intent-filter android:autoVerify="true">
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
-
-                <data
-                    android:scheme="https"
-                    android:host="barbecuez.no"
-                    android:pathPrefix="/order-tracking" />
+                <data android:scheme="https" android:host="barbecuez.no" />
             </intent-filter>
 
             <intent-filter android:autoVerify="true">
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
-
-                <data
-                    android:scheme="https"
-                    android:host="www.barbecuez.no"
-                    android:pathPrefix="/order-tracking" />
+                <data android:scheme="https" android:host="www.barbecuez.no" />
             </intent-filter>
 
         </activity>
