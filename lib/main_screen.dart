@@ -179,6 +179,20 @@ class _MainScreenState extends State<MainScreen>
   Future<void> _handleIncomingLink(Uri uri) async {
     debugPrint("Incoming deep link: $uri");
 
+    // Convert barbecuez:// custom scheme → https://barbecuez.no/...
+    if (uri.scheme == 'barbecuez') {
+      final path = uri.host.isNotEmpty ? '/${uri.host}${uri.path}' : uri.path;
+      final converted = Uri(
+        scheme: 'https',
+        host: allowedDomain,
+        path: path.isEmpty ? '/' : path,
+        queryParameters: uri.queryParameters.isEmpty ? null : uri.queryParameters,
+      );
+      debugPrint("Custom scheme converted → $converted");
+      await _handleIncomingLink(converted);
+      return;
+    }
+
     final isBarbecuezDomain =
         uri.host == allowedDomain || uri.host == 'www.$allowedDomain';
     if (!isBarbecuezDomain) return;
