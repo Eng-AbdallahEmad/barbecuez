@@ -657,8 +657,10 @@ class _MainScreenState extends State<MainScreen>
             }
 
             final scheme = uri.scheme.toLowerCase();
-            if (['tel', 'mailto', 'whatsapp', 'sms'].contains(scheme)) {
-              await launchUrl(uri, mode: LaunchMode.externalApplication);
+
+            // Native app schemes — launch directly without going through browser
+            if (['tel', 'mailto', 'whatsapp', 'sms', 'vipps', 'vippsmt'].contains(scheme)) {
+              await launchUrl(uri, mode: LaunchMode.externalNonBrowserApplication);
               return NavigationActionPolicy.CANCEL;
             }
 
