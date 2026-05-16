@@ -193,9 +193,8 @@ class _MainScreenState extends State<MainScreen>
       return;
     }
 
-    final isBarbecuezDomain =
-        uri.host == allowedDomain || uri.host == 'www.$allowedDomain';
-    if (!isBarbecuezDomain) return;
+    const allowedHosts = {'barbecuez.no', 'www.barbecuez.no', 'barbecuez.lovable.app'};
+    if (!allowedHosts.contains(uri.host)) return;
 
     // Order tracking → open in Home tab with token
     if (uri.path == '/order-tracking') {
@@ -350,6 +349,13 @@ class _MainScreenState extends State<MainScreen>
     await c.evaluateJavascript(source: script);
   }
 
+  String? _stringDataValue(Map<String, dynamic> data, String key) {
+    final value = data[key];
+    if (value == null) return null;
+    final stringValue = value.toString();
+    return stringValue.isEmpty ? null : stringValue;
+  }
+
   Future<void> _initOneSignal() async {
     OneSignal.User.pushSubscription.addObserver((state) {
       final newId = state.current.id;
@@ -398,7 +404,8 @@ class _MainScreenState extends State<MainScreen>
     });
 
     OneSignal.Notifications.addClickListener((event) async {
-      final url = event.notification.additionalData?['url'] as String?;
+      final n = event.notification;
+      final url = (n.additionalData?['url'] as String?) ?? n.launchUrl;
       if (url != null && url.isNotEmpty) {
         await _handleIncomingLink(Uri.parse(url));
       }
@@ -413,11 +420,14 @@ class _MainScreenState extends State<MainScreen>
 
     FirebaseMessaging.onMessage.listen((RemoteMessage message) async {
       final notification = message.notification;
-      if (notification != null) {
+      final title =
+          notification?.title ?? _stringDataValue(message.data, 'title');
+      final body = notification?.body ?? _stringDataValue(message.data, 'body');
+      if (notification != null || title != null || body != null) {
         await localNotifications.show(
-          id: notification.hashCode,
-          title: notification.title ?? 'Barbecuez',
-          body: notification.body ?? '',
+          id: message.messageId?.hashCode ?? message.hashCode,
+          title: title ?? 'Barbecuez',
+          body: body ?? '',
           notificationDetails: NotificationDetails(
             android: AndroidNotificationDetails(
               androidChannel.id,
@@ -437,22 +447,22 @@ class _MainScreenState extends State<MainScreen>
               presentSound: true,
             ),
           ),
-          payload: message.data['url'],
+          payload: _stringDataValue(message.data, 'url'),
         );
       }
     });
 
     FirebaseMessaging.onMessageOpenedApp.listen((RemoteMessage message) async {
-      final url = message.data['url'];
-      if (url != null && url.toString().isNotEmpty) {
+      final url = _stringDataValue(message.data, 'url');
+      if (url != null) {
         await _handleIncomingLink(Uri.parse(url));
       }
     });
 
     final initialMessage = await messaging.getInitialMessage();
     if (initialMessage != null) {
-      final url = initialMessage.data['url'];
-      if (url != null && url.toString().isNotEmpty) {
+      final url = _stringDataValue(initialMessage.data, 'url');
+      if (url != null) {
         await _handleIncomingLink(Uri.parse(url));
       }
     }
@@ -486,13 +496,6 @@ class _MainScreenState extends State<MainScreen>
     }
 
     SystemNavigator.pop();
-  }
-
-  bool _isExternalUrl(Uri uri) {
-    final host = uri.host.toLowerCase();
-    return host.isNotEmpty &&
-        host != allowedDomain &&
-        host != 'www.$allowedDomain';
   }
 
   // ─── Build ──────────────────────────────────────────────────────────────────
@@ -645,18 +648,18 @@ class _MainScreenState extends State<MainScreen>
             if (uri == null) return NavigationActionPolicy.ALLOW;
             if (!navigationAction.isForMainFrame) return NavigationActionPolicy.ALLOW;
 
-            // If Orders tab tries to navigate to home → switch to Home tab
+            const internalHosts = {'barbecuez.no', 'www.barbecuez.no', 'barbecuez.lovable.app'};
+            final host = uri.host.toLowerCase();
+            final scheme = uri.scheme.toLowerCase();
+
+            // If Contact tab tries to navigate to an internal home page → switch to Home tab
             if (index == 2) {
               final path = uri.path;
-              final isHomePage = (path == '/' || path.isEmpty) &&
-                  !_isExternalUrl(uri);
-              if (isHomePage) {
+              if ((path == '/' || path.isEmpty) && internalHosts.contains(host)) {
                 _switchToTab(0);
                 return NavigationActionPolicy.CANCEL;
               }
             }
-
-            final scheme = uri.scheme.toLowerCase();
 
             // Native app schemes — launch directly without going through browser
             if (['tel', 'mailto', 'whatsapp', 'sms', 'vipps', 'vippsmt'].contains(scheme)) {
@@ -664,7 +667,11 @@ class _MainScreenState extends State<MainScreen>
               return NavigationActionPolicy.CANCEL;
             }
 
-            if (_isExternalUrl(uri)) {
+            // Internal domains → always load inside the WebView, never via Safari
+            if (internalHosts.contains(host)) return NavigationActionPolicy.ALLOW;
+
+            // External http/https → open in system browser
+            if (['http', 'https'].contains(scheme)) {
               await launchUrl(uri, mode: LaunchMode.externalApplication);
               return NavigationActionPolicy.CANCEL;
             }

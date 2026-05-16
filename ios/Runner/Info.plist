@@ -78,7 +78,7 @@
 			<key>CFBundleTypeRole</key>
 			<string>Editor</string>
 			<key>CFBundleURLName</key>
-			<string>com.proteams.barbecuez</string>
+			<string>com.barbecuez.app</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
 				<string>barbecuez</string>

@@ -20,7 +20,9 @@ import UserNotifications
     GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
   }
 
-  // Universal Links (cold start via AppDelegate, not Scene Delegate)
+  // Universal Links and custom schemes are handled by FlutterSceneDelegate
+  // via scene(_:continue:) and scene(_:openURLContexts:) — not AppDelegate.
+  // These overrides exist only for fallback on older iOS versions without UIScene.
   override func application(
     _ application: UIApplication,
     continue userActivity: NSUserActivity,
@@ -29,7 +31,6 @@ import UserNotifications
     return super.application(application, continue: userActivity, restorationHandler: restorationHandler)
   }
 
-  // Custom URL scheme (barbecuez://)
   override func application(
     _ app: UIApplication,
     open url: URL,

@@ -59,10 +59,10 @@ class DefaultFirebaseOptions {
 
   static const FirebaseOptions ios = FirebaseOptions(
     apiKey: 'AIzaSyD9DrmoedtAr0Jtn_z8TWMbhXU-8RjdMUk',
-    appId: '1:776408358854:ios:ea35445fa43d94a1789cc7',
+    appId: '1:776408358854:ios:1d00a95f403db043789cc7',
     messagingSenderId: '776408358854',
     projectId: 'barbecuez-project',
     storageBucket: 'barbecuez-project.firebasestorage.app',
-    iosBundleId: 'com.proteams.barbecuez',
+    iosBundleId: 'com.barbecuez.app',
   );
 }
