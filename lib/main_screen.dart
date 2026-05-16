@@ -72,6 +72,9 @@ class _MainScreenState extends State<MainScreen>
 
   static const String _lastUrlKey = 'last_url';
 
+  String? _lastHandledUrl;
+  DateTime? _lastHandledTime;
+
   @override
   void initState() {
     super.initState();
@@ -178,6 +181,19 @@ class _MainScreenState extends State<MainScreen>
 
   Future<void> _handleIncomingLink(Uri uri) async {
     debugPrint("Incoming deep link: $uri");
+
+    // Deduplicate: iOS re-delivers the same Universal Link every time WKWebView
+    // navigates to barbecuez.no, creating an infinite loop. Ignore repeats within 3s.
+    final urlStr = uri.toString();
+    final now = DateTime.now();
+    if (_lastHandledUrl == urlStr &&
+        _lastHandledTime != null &&
+        now.difference(_lastHandledTime!) < const Duration(seconds: 3)) {
+      debugPrint('[DeepLink] Ignoring duplicate within 3s: $urlStr');
+      return;
+    }
+    _lastHandledUrl = urlStr;
+    _lastHandledTime = now;
 
     // Convert barbecuez:// custom scheme → https://barbecuez.no/...
     if (uri.scheme == 'barbecuez') {
