@@ -636,6 +636,18 @@ class _MainScreenState extends State<MainScreen>
             await _tryFetchAndInjectPlayerId();
             await _injectTrackingTokens(controller);
           },
+          onCreateWindow: (controller, createWindowAction) async {
+            final url = createWindowAction.request.url;
+            debugPrint('[CreateWindow] url=$url');
+            if (url == null) return false;
+            const internalHosts = {'barbecuez.no', 'www.barbecuez.no', 'barbecuez.lovable.app'};
+            if (internalHosts.contains(url.host.toLowerCase())) {
+              await controller.loadUrl(urlRequest: URLRequest(url: WebUri.uri(url)));
+            } else {
+              await launchUrl(url, mode: LaunchMode.inAppBrowserView);
+            }
+            return false;
+          },
           onGeolocationPermissionsShowPrompt: (controller, origin) async {
             return GeolocationPermissionShowPromptResponse(
               origin: origin,
@@ -674,10 +686,16 @@ class _MainScreenState extends State<MainScreen>
               return NavigationActionPolicy.ALLOW;
             }
 
-            // External http/https → open in system browser
+            // External http/https → open in SFSafariViewController (in-app browser).
+            // Using inAppBrowserView keeps auth flows (Google Sign-In, Nets payment)
+            // inside the app context. When the auth/payment provider redirects back
+            // to barbecuez.no, iOS fires our Universal Link and closes the in-app
+            // browser automatically, returning the user to the WebView session.
+            // This prevents the "1-second bounce to Safari" caused by Firebase Auth
+            // detecting an unauthenticated session and redirecting to Google Sign-In.
             if (['http', 'https'].contains(scheme)) {
-              debugPrint('[NavPolicy] → CANCEL + launchUrl (external: $uri)');
-              await launchUrl(uri, mode: LaunchMode.externalApplication);
+              debugPrint('[NavPolicy] → CANCEL + inAppBrowserView (external: $uri)');
+              await launchUrl(uri, mode: LaunchMode.inAppBrowserView);
               return NavigationActionPolicy.CANCEL;
             }
 
