@@ -44,17 +44,10 @@ import UserNotifications
 }
 
 // ---------------------------------------------------------------------------
-// SceneDelegate — defined here so it is always compiled as part of AppDelegate.swift
-// (no separate file needs to be added to the Xcode target).
-// Info.plist UISceneDelegateClassName = "Runner.SceneDelegate"
+// SceneDelegate — defined here so it is always compiled as part of AppDelegate.swift.
+// Info.plist UISceneDelegateClassName = "SceneDelegate"
 // ---------------------------------------------------------------------------
 
-/// Subclass of FlutterSceneDelegate that explicitly captures Universal Links
-/// and custom-scheme URLs, writing them to UserDefaults so Flutter can read
-/// them via shared_preferences (_handlePendingDeepLink).
-///
-/// FlutterSceneDelegate does not consistently forward scene:continue: to the
-/// app_links plugin, causing iOS to wait ~1 s and then fall back to Safari.
 @objc(SceneDelegate)
 class SceneDelegate: FlutterSceneDelegate {
 
@@ -65,44 +58,53 @@ class SceneDelegate: FlutterSceneDelegate {
     willConnectTo session: UISceneSession,
     options connectionOptions: UIScene.ConnectionOptions
   ) {
-    super.scene(scene, willConnectTo: session, options: connectionOptions)
-
-    // Universal Link delivered at launch
+    // ⚠️ Store the URL BEFORE calling super.
+    // super.scene() starts the Flutter engine, which may immediately read
+    // SharedPreferences on the Dart thread. If we call storePendingLink AFTER
+    // super, there is a race condition where Flutter reads UserDefaults before
+    // the URL has been written — causing _handlePendingDeepLink to find nothing.
     if let activity = connectionOptions.userActivities.first(where: {
       $0.activityType == NSUserActivityTypeBrowsingWeb
     }), let url = activity.webpageURL {
+      NSLog("[SceneDelegate] Cold-start Universal Link: %@", url.absoluteString)
       SceneDelegate.storePendingLink(url)
-      return
+    } else if let urlContext = connectionOptions.urlContexts.first {
+      NSLog("[SceneDelegate] Cold-start URL context: %@", urlContext.url.absoluteString)
+      SceneDelegate.storePendingLink(urlContext.url)
+    } else {
+      NSLog("[SceneDelegate] willConnectTo — no Universal Link or URL context")
     }
 
-    // Custom URL scheme (barbecuez://) delivered at launch
-    if let urlContext = connectionOptions.urlContexts.first {
-      SceneDelegate.storePendingLink(urlContext.url)
-    }
+    super.scene(scene, willConnectTo: session, options: connectionOptions)
   }
 
   // MARK: - Warm start
 
   override func scene(_ scene: UIScene, continue userActivity: NSUserActivity) {
-    super.scene(scene, continue: userActivity)
+    // Store before super for the same race-condition reason.
     if userActivity.activityType == NSUserActivityTypeBrowsingWeb,
        let url = userActivity.webpageURL {
+      NSLog("[SceneDelegate] Warm-start Universal Link: %@", url.absoluteString)
       SceneDelegate.storePendingLink(url)
     }
+    super.scene(scene, continue: userActivity)
   }
 
   override func scene(_ scene: UIScene, openURLContexts urlContexts: Set<UIOpenURLContext>) {
-    super.scene(scene, openURLContexts: urlContexts)
     if let urlContext = urlContexts.first {
+      NSLog("[SceneDelegate] Warm-start URL context: %@", urlContext.url.absoluteString)
       SceneDelegate.storePendingLink(urlContext.url)
     }
+    super.scene(scene, openURLContexts: urlContexts)
   }
 
   // MARK: - Storage
 
   /// Writes the URL to UserDefaults under the key shared_preferences uses on iOS.
-  /// Flutter reads it via: prefs.getString('pending_deep_link')
+  /// shared_preferences_foundation prefixes all keys with "flutter." so
+  /// prefs.getString('pending_deep_link') reads from "flutter.pending_deep_link".
   static func storePendingLink(_ url: URL) {
     UserDefaults.standard.set(url.absoluteString, forKey: "flutter.pending_deep_link")
+    NSLog("[SceneDelegate] Stored pending_deep_link = %@", url.absoluteString)
   }
 }

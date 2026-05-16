@@ -116,13 +116,12 @@ class _MainScreenState extends State<MainScreen>
     }
   }
 
-  // ← NEW: Handle pending deep link from SharedPreferences
   Future<void> _handlePendingDeepLink() async {
     final prefs = await SharedPreferences.getInstance();
     final pendingUrl = prefs.getString('pending_deep_link');
+    debugPrint('[DeepLink] _handlePendingDeepLink: found="${pendingUrl ?? 'null'}"');
     if (pendingUrl != null && pendingUrl.isNotEmpty) {
       await prefs.remove('pending_deep_link');
-      // Parse and handle immediately
       await _handleIncomingLink(Uri.parse(pendingUrl));
     }
   }
@@ -652,6 +651,7 @@ class _MainScreenState extends State<MainScreen>
             const internalHosts = {'barbecuez.no', 'www.barbecuez.no', 'barbecuez.lovable.app'};
             final host = uri.host.toLowerCase();
             final scheme = uri.scheme.toLowerCase();
+            debugPrint('[NavPolicy] tab=$index url=$uri host=$host scheme=$scheme');
 
             // If Contact tab tries to navigate to an internal home page → switch to Home tab
             if (index == 2) {
@@ -669,10 +669,14 @@ class _MainScreenState extends State<MainScreen>
             }
 
             // Internal domains → always load inside the WebView, never via Safari
-            if (internalHosts.contains(host)) return NavigationActionPolicy.ALLOW;
+            if (internalHosts.contains(host)) {
+              debugPrint('[NavPolicy] → ALLOW (internal)');
+              return NavigationActionPolicy.ALLOW;
+            }
 
             // External http/https → open in system browser
             if (['http', 'https'].contains(scheme)) {
+              debugPrint('[NavPolicy] → CANCEL + launchUrl (external: $uri)');
               await launchUrl(uri, mode: LaunchMode.externalApplication);
               return NavigationActionPolicy.CANCEL;
             }
