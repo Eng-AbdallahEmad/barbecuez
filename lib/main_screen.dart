@@ -102,11 +102,12 @@ class _MainScreenState extends State<MainScreen>
     super.dispose();
   }
 
-  // ← NEW: Re-inject tokens when app resumes
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     super.didChangeAppLifecycleState(state);
     if (state == AppLifecycleState.resumed) {
+      // Pick up any Universal Link stored by SceneDelegate while app was in background
+      _handlePendingDeepLink();
       for (final controller in _webControllers) {
         if (controller != null) {
           _injectTrackingTokens(controller);
