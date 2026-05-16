@@ -182,14 +182,16 @@ class _MainScreenState extends State<MainScreen>
   Future<void> _handleIncomingLink(Uri uri) async {
     debugPrint("Incoming deep link: $uri");
 
-    // Deduplicate: iOS re-delivers the same Universal Link every time WKWebView
-    // navigates to barbecuez.no, creating an infinite loop. Ignore repeats within 3s.
+    // Deduplicate: iOS re-delivers the same Universal Link each time WKWebView
+    // navigates to barbecuez.no. 3 s was too short — a slow first-load (>3 s)
+    // would expire the window, causing _loadUrlInTab to fire again and restart
+    // the loop. 30 s covers any realistic page-load time on a real device.
     final urlStr = uri.toString();
     final now = DateTime.now();
     if (_lastHandledUrl == urlStr &&
         _lastHandledTime != null &&
-        now.difference(_lastHandledTime!) < const Duration(seconds: 3)) {
-      debugPrint('[DeepLink] Ignoring duplicate within 3s: $urlStr');
+        now.difference(_lastHandledTime!) < const Duration(seconds: 30)) {
+      debugPrint('[DeepLink] Ignoring duplicate within 30s: $urlStr');
       return;
     }
     _lastHandledUrl = urlStr;
@@ -321,7 +323,19 @@ class _MainScreenState extends State<MainScreen>
   Future<void> _loadUrlInTab(int tabIndex, String url) async {
     final controller = _webControllers[tabIndex];
     if (controller != null) {
-      await controller.loadUrl(urlRequest: URLRequest(url: WebUri(url)));
+      // Use JS navigation instead of loadUrl(). iOS intercepts native WKWebView
+      // load() calls to Universal Link domains and re-delivers them to the app,
+      // restarting the loop. JS-initiated navigations (window.location.href) are
+      // treated as website-initiated and do not trigger Universal Link re-delivery.
+      final escaped = url.replaceAll("'", r"\'");
+      try {
+        await controller.evaluateJavascript(
+          source: "window.location.href = '$escaped';",
+        );
+      } catch (_) {
+        // Fallback: WebView not ready for JS evaluation yet.
+        await controller.loadUrl(urlRequest: URLRequest(url: WebUri(url)));
+      }
     } else {
       _currentUrls[tabIndex] = url;
     }
