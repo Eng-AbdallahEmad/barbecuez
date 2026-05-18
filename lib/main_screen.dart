@@ -182,19 +182,28 @@ class _MainScreenState extends State<MainScreen>
   Future<void> _handleIncomingLink(Uri uri) async {
     debugPrint("Incoming deep link: $uri");
 
-    // Deduplicate: iOS re-delivers the same Universal Link each time WKWebView
-    // navigates to barbecuez.no. 3 s was too short — a slow first-load (>3 s)
-    // would expire the window, causing _loadUrlInTab to fire again and restart
-    // the loop. 30 s covers any realistic page-load time on a real device.
-    final urlStr = uri.toString();
+    // Deduplicate within 30 s.
+    //
+    // Root-URL Universal Links (path = "" or "/") are normalised to
+    // "https://host/" for the dedup key so that query-param variants
+    // produced by Firebase Auth / cookie-consent redirect chains
+    // (e.g. https://barbecuez.no/?session=xyz) are treated as the same
+    // delivery and do not restart the loop.
+    final isRootUrl = (uri.path.isEmpty || uri.path == '/') &&
+        const {'barbecuez.no', 'www.barbecuez.no', 'barbecuez.lovable.app'}
+            .contains(uri.host);
+    final urlForDedup = isRootUrl
+        ? '${uri.scheme}://${uri.host}/'
+        : uri.toString();
+
     final now = DateTime.now();
-    if (_lastHandledUrl == urlStr &&
+    if (_lastHandledUrl == urlForDedup &&
         _lastHandledTime != null &&
         now.difference(_lastHandledTime!) < const Duration(seconds: 30)) {
-      debugPrint('[DeepLink] Ignoring duplicate within 30s: $urlStr');
+      debugPrint('[DeepLink] Ignoring duplicate within 30s: $urlForDedup');
       return;
     }
-    _lastHandledUrl = urlStr;
+    _lastHandledUrl = urlForDedup;
     _lastHandledTime = now;
 
     // Convert barbecuez:// custom scheme → https://barbecuez.no/...
@@ -252,7 +261,13 @@ class _MainScreenState extends State<MainScreen>
 
     // Default → Home tab
     _switchToTab(0);
-    await _loadUrlInTab(0, uri.toString());
+    // For the root URL, skip WebView navigation — the home tab already has
+    // barbecuez.no loaded.  Navigating again triggers shouldOverrideUrlLoading
+    // chains (auth/cookie-consent redirects) that open SFSafariViewController,
+    // which then fires a new Universal Link and creates a Safari ↔ app loop.
+    if (!isRootUrl) {
+      await _loadUrlInTab(0, uri.toString());
+    }
   }
 
   void _switchToTab(int index) {
