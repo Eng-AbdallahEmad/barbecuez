@@ -685,12 +685,11 @@ class _MainScreenState extends State<MainScreen>
             final url = createWindowAction.request.url;
             debugPrint('[CreateWindow] url=$url');
             if (url == null) return false;
-            const internalHosts = {'barbecuez.no', 'www.barbecuez.no', 'barbecuez.lovable.app'};
-            if (internalHosts.contains(url.host.toLowerCase())) {
-              await controller.loadUrl(urlRequest: URLRequest(url: WebUri.uri(url)));
-            } else {
-              await launchUrl(url, mode: LaunchMode.inAppBrowserView);
-            }
+            // Load ALL popup URLs (internal AND external) inside the WebView.
+            // Opening external popups in SFSafariViewController creates a
+            // Universal Link loop when the auth/payment provider redirects
+            // back to barbecuez.no (Safari sees it as a new Universal Link).
+            await controller.loadUrl(urlRequest: URLRequest(url: WebUri.uri(url)));
             return false;
           },
           onGeolocationPermissionsShowPrompt: (controller, origin) async {
@@ -731,17 +730,20 @@ class _MainScreenState extends State<MainScreen>
               return NavigationActionPolicy.ALLOW;
             }
 
-            // External http/https → open in SFSafariViewController (in-app browser).
-            // Using inAppBrowserView keeps auth flows (Google Sign-In, Nets payment)
-            // inside the app context. When the auth/payment provider redirects back
-            // to barbecuez.no, iOS fires our Universal Link and closes the in-app
-            // browser automatically, returning the user to the WebView session.
-            // This prevents the "1-second bounce to Safari" caused by Firebase Auth
-            // detecting an unauthenticated session and redirecting to Google Sign-In.
+            // External http/https:
+            // Only open in SFSafariViewController when the user explicitly tapped
+            // a link (LINK_ACTIVATED).  Programmatic redirects — Firebase Auth,
+            // payment callbacks, cookie-consent — are allowed inside the WebView so
+            // they share the WebView cookie jar and cannot create a
+            // SFSafariViewController → Universal Link → app loop.
             if (['http', 'https'].contains(scheme)) {
-              debugPrint('[NavPolicy] → CANCEL + inAppBrowserView (external: $uri)');
-              await launchUrl(uri, mode: LaunchMode.inAppBrowserView);
-              return NavigationActionPolicy.CANCEL;
+              if (navigationAction.navigationType == NavigationType.LINK_ACTIVATED) {
+                debugPrint('[NavPolicy] → CANCEL + inAppBrowserView (user link: $uri)');
+                await launchUrl(uri, mode: LaunchMode.inAppBrowserView);
+                return NavigationActionPolicy.CANCEL;
+              }
+              debugPrint('[NavPolicy] → ALLOW (programmatic redirect: $uri)');
+              return NavigationActionPolicy.ALLOW;
             }
 
             return NavigationActionPolicy.ALLOW;
