@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Enforces TLS for all outbound connections.
+  Cleartext (plain HTTP) is blocked in release builds by this config.
+  The WebView inherits this policy, so mixed-content HTTP subresources are
+  also blocked (InAppWebViewSettings already sets MIXED_CONTENT_NEVER_ALLOW).
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system"/>
+        </trust-anchors>
+    </base-config>
+</network-security-config>

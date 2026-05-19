@@ -13,7 +13,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'firebase_options.dart';
 import 'splash_screen.dart';
 
-const String oneSignalAppId = "0b6800a4-7b08-406d-b32c-6051c1472844";
+const String oneSignalAppId = "9ed07efc-3ef8-4198-940a-0b985286be27";
 
 final FlutterLocalNotificationsPlugin localNotifications =
 FlutterLocalNotificationsPlugin();

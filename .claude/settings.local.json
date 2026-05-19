@@ -3,7 +3,8 @@
     "allow": [
       "Bash(dart analyze *)",
       "Bash(Get-ChildItem -Recurse -Depth 3)",
-      "Bash(Select-Object FullName)"
+      "Bash(Select-Object FullName)",
+      "Bash(flutter analyze *)"
     ]
   }
 }
