@@ -15,6 +15,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../main.dart';
+import '../services/live_activity_service.dart';
 import '../services/tracking_token_store.dart';
 
 // ─── Tab config ───────────────────────────────────────────────────────────────
@@ -1029,6 +1030,86 @@ class _MainScreenState extends State<MainScreen>
                 return null;
               },
             );
+
+            // ── Live Activity JS handlers ──────────────────────────────────
+            // The barbecuez.no web app calls these via
+            // window.flutter_inappwebview.callHandler('startLiveActivity', {...})
+
+            controller.addJavaScriptHandler(
+              handlerName: 'startLiveActivity',
+              callback: (args) async {
+                if (!Platform.isIOS || args.isEmpty) return {'success': false};
+                final data = args[0] is Map
+                    ? Map<String, dynamic>.from(args[0] as Map)
+                    : <String, dynamic>{};
+
+                final activityId = await LiveActivityService.start(
+                  orderNumber: data['orderNumber']?.toString() ?? '',
+                  orderType:   data['orderType']?.toString()   ?? 'delivery',
+                  totalAmount: data['totalAmount']?.toString() ?? '',
+                  status:      data['status']?.toString()      ?? 'pending',
+                  statusLabel: data['statusLabel']?.toString() ?? 'Processing order',
+                  etaMinutes:  (data['etaMinutes'] as num?)?.toInt() ?? 30,
+                  progress:    (data['progress']   as num?)?.toDouble() ?? 0.1,
+                  driverName:  data['driverName']?.toString(),
+                  driverPhone: data['driverPhone']?.toString(),
+                );
+
+                if (activityId != null) {
+                  // Stream push token back to the web page so it can store
+                  // it in Supabase via the existing Supabase JS client.
+                  LiveActivityService.listenForPushToken((token, id) async {
+                    try {
+                      final escaped = token.replaceAll("'", r"\'");
+                      final escapedId = id.replaceAll("'", r"\'");
+                      await controller.evaluateJavascript(source: '''
+                        if (typeof window.__onLiveActivityToken === 'function') {
+                          window.__onLiveActivityToken({ token: '$escaped', activityId: '$escapedId' });
+                        }
+                      ''');
+                    } catch (_) {}
+                  });
+                }
+
+                return {'success': activityId != null, 'activityId': activityId ?? ''};
+              },
+            );
+
+            controller.addJavaScriptHandler(
+              handlerName: 'updateLiveActivity',
+              callback: (args) async {
+                if (!Platform.isIOS || args.isEmpty) return {'success': false};
+                final data = args[0] is Map
+                    ? Map<String, dynamic>.from(args[0] as Map)
+                    : <String, dynamic>{};
+
+                await LiveActivityService.update(
+                  status:      data['status']?.toString()      ?? 'preparing',
+                  statusLabel: data['statusLabel']?.toString() ?? '',
+                  etaMinutes:  (data['etaMinutes'] as num?)?.toInt() ?? 20,
+                  progress:    (data['progress']   as num?)?.toDouble() ?? 0.5,
+                  driverName:  data['driverName']?.toString(),
+                  driverPhone: data['driverPhone']?.toString(),
+                );
+                return {'success': true};
+              },
+            );
+
+            controller.addJavaScriptHandler(
+              handlerName: 'endLiveActivity',
+              callback: (args) async {
+                if (!Platform.isIOS) return {'success': false};
+                final data = args.isNotEmpty && args[0] is Map
+                    ? Map<String, dynamic>.from(args[0] as Map)
+                    : <String, dynamic>{};
+                await LiveActivityService.end(
+                  statusLabel: data['statusLabel']?.toString() ?? 'Order delivered!',
+                );
+                LiveActivityService.cancelTokenListener();
+                return {'success': true};
+              },
+            );
+            // ─────────────────────────────────────────────────────────────
 
             _injectTrackingTokens(controller);
             _injectPlayerIdIntoWebView(controller);

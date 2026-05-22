@@ -4,7 +4,19 @@
       "Bash(dart analyze *)",
       "Bash(Get-ChildItem -Recurse -Depth 3)",
       "Bash(Select-Object FullName)",
-      "Bash(flutter analyze *)"
+      "Bash(flutter analyze *)",
+      "Bash(mkdir -p /Volumes/Macintosh_HD/Users/user297337/StudioProjects/barbecuez/ios/OrderTrackingWidget)",
+      "Bash(mkdir -p /Volumes/Macintosh_HD/Users/user297337/StudioProjects/barbecuez/supabase/functions/push-live-activity)",
+      "Bash(mkdir -p /Volumes/Macintosh_HD/Users/user297337/StudioProjects/barbecuez/supabase/migrations)",
+      "Bash(flutter clean *)",
+      "Bash(flutter pub *)",
+      "Bash(pod install *)",
+      "Bash(xcodebuild -workspace /Volumes/Macintosh_HD/Users/user297337/StudioProjects/barbecuez/ios/Runner.xcworkspace -scheme Runner -configuration Debug -destination generic/platform=iOS CODE_SIGNING_ALLOWED=NO)",
+      "Bash(gem list *)",
+      "Bash(ruby --version)",
+      "Bash(/opt/homebrew/Cellar/cocoapods/1.16.2_2/libexec/bin/ruby *)",
+      "Bash(/opt/homebrew/opt/ruby/bin/ruby *)",
+      "Bash(plutil -p ~/Library/Developer/Xcode/DerivedData/Runner-*/Build/Products/Debug-iphoneos/Runner.app/PlugIns/OrderTrackingWidget.appex/Info.plist)"
     ]
   }
 }
