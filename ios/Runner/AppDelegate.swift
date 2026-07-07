@@ -18,6 +18,11 @@ import UserNotifications
 
   func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
     GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
+
+    if #available(iOS 16.2, *),
+       let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "LiveActivityPlugin") {
+      LiveActivityPlugin.register(with: registrar)
+    }
   }
 
   // Fallback for iOS 12 and below (no SceneDelegate).
