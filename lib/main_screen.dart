@@ -1,8 +1,10 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:app_links/app_links.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
@@ -31,16 +33,23 @@ class _TabConfig {
 }
 
 const List<_TabConfig> _tabs = [
-  _TabConfig(label: 'Home',   icon: Icons.home_outlined,           url: 'https://barbecuez.no'),
-  _TabConfig(label: 'Menu',   icon: Icons.restaurant_menu_outlined, url: 'https://barbecuez.no/menu'),
-  _TabConfig(label: 'Contact', icon: Icons.info_outline,   url: 'https://barbecuez.no/contact'),
+  _TabConfig(label: 'Home',    icon: Icons.home_outlined,            url: 'https://barbecuez.no'),
+  _TabConfig(label: 'Menu',    icon: Icons.restaurant_menu_outlined,  url: 'https://barbecuez.no/menu'),
+  _TabConfig(label: 'Contact', icon: Icons.info_outline,              url: 'https://barbecuez.no/contact'),
 ];
 
-// ─── MainScreen (Native Tab Shell) ────────────────────────────────────────────
+// ─── Trusted origins ──────────────────────────────────────────────────────────
+
+const Set<String> _trustedHosts = {
+  'barbecuez.no',
+  'www.barbecuez.no',
+  'barbecuez.lovable.app',
+};
+
+// ─── MainScreen ───────────────────────────────────────────────────────────────
 
 class MainScreen extends StatefulWidget {
   final String? initialUrl;
-
   const MainScreen({super.key, this.initialUrl});
 
   @override
@@ -55,54 +64,91 @@ class _MainScreenState extends State<MainScreen>
 
   int _currentIndex = 0;
 
-  // One controller slot per tab — filled lazily on first visit
-  final List<InAppWebViewController?> _webControllers = List.filled(_tabs.length, null);
+  final List<InAppWebViewController?> _webControllers =
+      List.filled(_tabs.length, null);
   final List<String?> _currentUrls = List.filled(_tabs.length, null);
 
-  // Keep all tab WebViews alive with IndexedStack
-  final List<GlobalKey> _tabKeys = List.generate(_tabs.length, (_) => GlobalKey());
+  final List<GlobalKey> _tabKeys =
+      List.generate(_tabs.length, (_) => GlobalKey());
 
   final AppLinks _appLinks = AppLinks();
   StreamSubscription<Uri>? _appLinksSub;
 
-  String? _oneSignalPlayerId;
+  // ── OneSignal bridge ─────────────────────────────────────────────────────
+  String? _cachedPlayerId;
   Timer? _playerIdRetryTimer;
+  Timer? _heartbeatTimer;
+  final Set<int> _injectingControllers = {};
+  final Map<int, DateTime> _lastSuccessfulInjection = {};
+  bool _disposed = false;
+  static const int _kMaxWebReadinessRetries = 4;
+  static const Duration _kHeartbeatInterval = Duration(seconds: 45);
+  // ─────────────────────────────────────────────────────────────────────────
 
-  final String allowedDomain = "barbecuez.no";
+  // ── localStorage consent cache ────────────────────────────────────────────
+  // Snapshot of barbecuez.no localStorage, kept in sync with every onLoadStop
+  // and persisted to SharedPreferences so consent survives app restarts.
+  //
+  // On each fresh WebView load a UserScript fires at AT_DOCUMENT_START to
+  // pre-populate localStorage before any page JS runs — this prevents the
+  // cookie-consent banner from appearing on tabs that haven't set it yet.
+  Map<String, String> _lsCache = {};
+  static const String _kLsCachePrefsKey = 'webview_localstorage_snapshot';
+  late final Future<void> _lsCacheReady;
+  // ─────────────────────────────────────────────────────────────────────────
+
+  // Player-ID UUID pattern — OneSignal always issues UUIDs.
+  static final _playerIdRe = RegExp(
+    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
+    caseSensitive: false,
+  );
+
+  final String allowedDomain = 'barbecuez.no';
   DateTime? _lastBackPressed;
-
-  static const String _lastUrlKey = 'last_url';
-
   String? _lastHandledUrl;
   DateTime? _lastHandledTime;
+
+  // ─── Lifecycle ──────────────────────────────────────────────────────────────
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
 
-    // Handle pending deep link from cold start
-    _handlePendingDeepLink();
+    // Start loading the localStorage cache immediately so it is ready when
+    // the first WebView is created.
+    _lsCacheReady = _loadLsCache();
 
+    _handlePendingDeepLink();
     _initFirebaseNotifications();
     _initOneSignal();
     _initDeepLinks();
 
     onNotificationDeepLink = _handleIncomingLink;
 
-    _playerIdRetryTimer = Timer.periodic(const Duration(seconds: 3), (_) {
-      _tryFetchAndInjectPlayerId();
-    });
+    _playerIdRetryTimer = Timer.periodic(
+      const Duration(seconds: 3),
+      (_) => _tryFetchAndInjectPlayerId(),
+    );
+
+    _heartbeatTimer = Timer.periodic(
+      _kHeartbeatInterval,
+      (_) => _heartbeatTick(),
+    );
   }
 
   @override
   void dispose() {
+    _disposed = true;
     if (onNotificationDeepLink == _handleIncomingLink) {
       onNotificationDeepLink = null;
     }
     WidgetsBinding.instance.removeObserver(this);
     _playerIdRetryTimer?.cancel();
+    _heartbeatTimer?.cancel();
     _appLinksSub?.cancel();
+    _injectingControllers.clear();
+    _lastSuccessfulInjection.clear();
     super.dispose();
   }
 
@@ -110,41 +156,219 @@ class _MainScreenState extends State<MainScreen>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     super.didChangeAppLifecycleState(state);
     if (state == AppLifecycleState.resumed) {
-      // Pick up any Universal Link stored by SceneDelegate while app was in background
       _handlePendingDeepLink();
       for (final controller in _webControllers) {
         if (controller != null) {
           _injectTrackingTokens(controller);
+          _injectPlayerIdIntoWebView(controller);
         }
       }
     }
   }
 
+  // ─── Controller cleanup ──────────────────────────────────────────────────────
+
+  void _cleanupControllerState(int hashCode) {
+    _injectingControllers.remove(hashCode);
+    _lastSuccessfulInjection.remove(hashCode);
+  }
+
+  // ─── localStorage consent cache ──────────────────────────────────────────────
+
+  // Keys that contain auth credentials — never pre-inject these into other tabs.
+  // Supabase stores sessions under "sb-*-auth-token"; we block all sb-* and
+  // any key containing common auth-token substrings.
+  static bool _isAuthKey(String key) {
+    final k = key.toLowerCase();
+    return k.startsWith('sb-') ||
+        k.contains('supabase') ||
+        k.contains('access_token') ||
+        k.contains('refresh_token') ||
+        k.contains('auth.token') ||
+        k.contains('.session');
+  }
+
+  Future<void> _loadLsCache() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_kLsCachePrefsKey);
+      if (raw != null && raw.isNotEmpty) {
+        final m = jsonDecode(raw);
+        if (m is Map) {
+          _lsCache = Map.fromEntries(
+            m.entries.map((e) => MapEntry(e.key.toString(), e.value.toString())),
+          );
+        }
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _saveLsCache() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_kLsCachePrefsKey, jsonEncode(_lsCache));
+    } catch (_) {}
+  }
+
+  /// Reads all localStorage from [controller], merges new/changed keys into
+  /// [_lsCache], persists to SharedPreferences, and refreshes the preload
+  /// UserScript on every controller so future page loads see the consent key
+  /// before any page JS runs.
+  Future<void> _captureAndSyncLs(InAppWebViewController controller) async {
+    if (_disposed) return;
+
+    // Only capture from trusted origin pages.
+    final currentUrl = await controller.getUrl();
+    if (currentUrl == null || !_trustedHosts.contains(currentUrl.host)) return;
+
+    try {
+      final raw = await controller.evaluateJavascript(source: '''
+        (function() {
+          try {
+            var d = {};
+            for (var i = 0; i < localStorage.length; i++) {
+              var k = localStorage.key(i);
+              if (k) d[k] = localStorage.getItem(k) || '';
+            }
+            return JSON.stringify(d);
+          } catch(e) { return null; }
+        })();
+      ''');
+      if (raw == null || raw == 'null' || raw.isEmpty) return;
+
+      final map = jsonDecode(raw.toString()) as Map<String, dynamic>;
+      bool changed = false;
+      for (final e in map.entries) {
+        final v = e.value?.toString() ?? '';
+        if (_lsCache[e.key] != v) {
+          _lsCache[e.key] = v;
+          changed = true;
+        }
+      }
+      if (changed) {
+        await _saveLsCache();
+        await _refreshAllPreloadScripts();
+      }
+    } catch (_) {}
+  }
+
+  /// Builds a JS IIFE that, at AT_DOCUMENT_START, pre-populates localStorage
+  /// with cached values — but ONLY for keys that are absent, so it never
+  /// overwrites fresh values the website has already set.
+  ///
+  /// Auth tokens are excluded: they must come from the website's own auth flow.
+  String _buildPreloadScript() {
+    final safe = Map.fromEntries(
+      _lsCache.entries.where((e) => !_isAuthKey(e.key)),
+    );
+    if (safe.isEmpty) return '';
+
+    final jsonStr = jsonEncode(safe);
+    return '''
+      (function(c){
+        try{
+          Object.keys(c).forEach(function(k){
+            if(localStorage.getItem(k)===null){
+              localStorage.setItem(k,c[k]);
+            }
+          });
+        }catch(e){}
+      })(${jsonStr});
+    ''';
+  }
+
+  Future<void> _refreshPreloadScript(InAppWebViewController controller) async {
+    if (_disposed) return;
+    final script = _buildPreloadScript();
+    try {
+      // Remove old preload scripts and add the freshly-built one.
+      // AT_DOCUMENT_START fires before any page JS — the consent key will be
+      // present when the website's React/Vue bundle reads it.
+      await controller.removeAllUserScripts();
+      if (script.isNotEmpty) {
+        await controller.addUserScript(
+          userScript: UserScript(
+            source: script,
+            injectionTime: UserScriptInjectionTime.AT_DOCUMENT_START,
+            allowedOriginRules: const {
+              'https://barbecuez.no',
+              'https://www.barbecuez.no',
+              'https://barbecuez.lovable.app',
+            },
+          ),
+        );
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _refreshAllPreloadScripts() async {
+    if (_disposed) return;
+    for (final c in _webControllers) {
+      if (c != null) await _refreshPreloadScript(c);
+    }
+  }
+
+  // ─── Heartbeat ───────────────────────────────────────────────────────────────
+
+  Future<void> _heartbeatTick() async {
+    if (_disposed || _cachedPlayerId == null) return;
+
+    for (int i = 0; i < _webControllers.length; i++) {
+      final controller = _webControllers[i];
+      if (controller == null) continue;
+      final cid = controller.hashCode;
+
+      try {
+        final raw = await controller.evaluateJavascript(
+          source: _buildHeartbeatScript(),
+        );
+        if (raw == null || raw == 'null' || raw.isEmpty) continue;
+
+        final data = jsonDecode(raw.toString()) as Map<String, dynamic>;
+        final ssValue = data['sessionStorage'] as String?;
+        final ssOk = ssValue == _cachedPlayerId;
+        final lastInj = _lastSuccessfulInjection[cid];
+        final ageSecs =
+            lastInj != null ? DateTime.now().difference(lastInj).inSeconds : null;
+
+        if (kDebugMode) {
+          debugPrint(
+            '[OneSignalBridge] 💓 tab=$i cid=$cid '
+            'ss=${ssOk ? "✅" : "❌($ssValue)"} '
+            'lastInj=${ageSecs != null ? "${ageSecs}s ago" : "never"}',
+          );
+        }
+
+        if (!ssOk) await _injectPlayerIdIntoWebView(controller);
+      } catch (_) {}
+    }
+  }
+
+  // ─── Pending deep link ───────────────────────────────────────────────────────
+
   Future<void> _handlePendingDeepLink() async {
     final prefs = await SharedPreferences.getInstance();
     final pendingUrl = prefs.getString('pending_deep_link');
-    debugPrint('[DeepLink] _handlePendingDeepLink: found="${pendingUrl ?? 'null'}"');
+    if (kDebugMode) {
+      debugPrint('[DeepLink] pending="${pendingUrl ?? 'null'}"');
+    }
     if (pendingUrl != null && pendingUrl.isNotEmpty) {
       await prefs.remove('pending_deep_link');
       await _handleIncomingLink(Uri.parse(pendingUrl));
     }
   }
 
-  // ─── Tracking tokens ────────────────────────────────────────────────────────
+  // ─── Tracking tokens ─────────────────────────────────────────────────────────
 
   Future<void> _injectTrackingTokens(InAppWebViewController controller) async {
     try {
       final tokens = await TrackingTokenStore.readAll();
-      if (tokens.isEmpty) {
-        debugPrint('📭 No tracking tokens to inject');
-        return;
-      }
+      if (tokens.isEmpty) return;
       final json = jsonEncode(tokens);
       await controller.evaluateJavascript(source: '''
         (function() {
           if (window.__setTrackingTokens) {
             window.__setTrackingTokens($json);
-            console.log('✅ Restored ' + Object.keys($json).length + ' tracking tokens from native');
           } else {
             setTimeout(function() {
               if (window.__setTrackingTokens) window.__setTrackingTokens($json);
@@ -152,20 +376,17 @@ class _MainScreenState extends State<MainScreen>
           }
         })();
       ''');
-      debugPrint('📤 Injected ${tokens.length} tokens');
-    } catch (e) {
-      debugPrint('❌ Token injection error: $e');
-    }
+    } catch (_) {}
   }
 
-  // ─── Deep Links ─────────────────────────────────────────────────────────────
+  // ─── Deep links ──────────────────────────────────────────────────────────────
 
   Future<void> _initDeepLinks() async {
     try {
       final Uri? initialUri = await _appLinks.getInitialLink();
       if (initialUri != null) await _handleIncomingLink(initialUri);
     } catch (e) {
-      debugPrint("Deep link getInitialLink error: $e");
+      if (kDebugMode) debugPrint('Deep link getInitialLink error: $e');
     }
 
     _appLinksSub = _appLinks.uriLinkStream.listen(
@@ -173,78 +394,68 @@ class _MainScreenState extends State<MainScreen>
         try {
           await _handleIncomingLink(uri);
         } catch (e) {
-          debugPrint("Deep link handle error: $e");
+          if (kDebugMode) debugPrint('Deep link handle error: $e');
         }
       },
-      onError: (e) => debugPrint("Deep link stream error: $e"),
+      onError: (e) {
+        if (kDebugMode) debugPrint('Deep link stream error: $e');
+      },
     );
   }
 
   Future<void> _handleIncomingLink(Uri uri) async {
-    debugPrint("Incoming deep link: $uri");
+    if (kDebugMode) debugPrint('Incoming deep link: $uri');
 
-    // Deduplicate within 30 s.
-    //
-    // Root-URL Universal Links (path = "" or "/") are normalised to
-    // "https://host/" for the dedup key so that query-param variants
-    // produced by Firebase Auth / cookie-consent redirect chains
-    // (e.g. https://barbecuez.no/?session=xyz) are treated as the same
-    // delivery and do not restart the loop.
     final isRootUrl = (uri.path.isEmpty || uri.path == '/') &&
-        const {'barbecuez.no', 'www.barbecuez.no', 'barbecuez.lovable.app'}
-            .contains(uri.host);
-    final urlForDedup = isRootUrl
-        ? '${uri.scheme}://${uri.host}/'
-        : uri.toString();
+        _trustedHosts.contains(uri.host);
+    final urlForDedup =
+        isRootUrl ? '${uri.scheme}://${uri.host}/' : uri.toString();
 
     final now = DateTime.now();
     if (_lastHandledUrl == urlForDedup &&
         _lastHandledTime != null &&
         now.difference(_lastHandledTime!) < const Duration(seconds: 30)) {
-      debugPrint('[DeepLink] Ignoring duplicate within 30s: $urlForDedup');
+      if (kDebugMode) {
+        debugPrint('[DeepLink] Ignoring duplicate within 30 s: $urlForDedup');
+      }
       return;
     }
     _lastHandledUrl = urlForDedup;
     _lastHandledTime = now;
 
-    // Convert barbecuez:// custom scheme → https://barbecuez.no/...
     if (uri.scheme == 'barbecuez') {
       final path = uri.host.isNotEmpty ? '/${uri.host}${uri.path}' : uri.path;
       final converted = Uri(
         scheme: 'https',
         host: allowedDomain,
         path: path.isEmpty ? '/' : path,
-        queryParameters: uri.queryParameters.isEmpty ? null : uri.queryParameters,
+        queryParameters:
+            uri.queryParameters.isEmpty ? null : uri.queryParameters,
       );
-      debugPrint("Custom scheme converted → $converted");
+      if (kDebugMode) debugPrint('Custom scheme converted → $converted');
       await _handleIncomingLink(converted);
       return;
     }
 
-    const allowedHosts = {'barbecuez.no', 'www.barbecuez.no', 'barbecuez.lovable.app'};
-    if (!allowedHosts.contains(uri.host)) return;
+    if (!_trustedHosts.contains(uri.host)) return;
 
-    // Order tracking → open in Home tab with token
     if (uri.path == '/order-tracking') {
       final orderNumber = uri.queryParameters['order'];
       final token = uri.queryParameters['tt'];
 
-      // Save token if present
       if (orderNumber != null && token != null && token.isNotEmpty) {
         await TrackingTokenStore.set(orderNumber, token);
-        debugPrint("💾 Token saved from deep link: $orderNumber");
       }
 
-      // Build URL with token for instant loading
       String targetUrl = 'https://$allowedDomain/order-tracking';
       if (orderNumber != null && orderNumber.isNotEmpty) {
         final savedToken = await TrackingTokenStore.get(orderNumber);
         if (savedToken != null && savedToken.isNotEmpty) {
-          targetUrl = 'https://$allowedDomain/order-tracking?order=$orderNumber&tt=$savedToken';
-          debugPrint("🚀 FAST: Opening tracking with token: $targetUrl");
+          targetUrl =
+              'https://$allowedDomain/order-tracking?order=$orderNumber&tt=$savedToken';
         } else {
-          targetUrl = 'https://$allowedDomain/order-tracking?order=$orderNumber';
-          debugPrint("⚠️ No token found for: $orderNumber");
+          targetUrl =
+              'https://$allowedDomain/order-tracking?order=$orderNumber';
         }
       }
 
@@ -253,19 +464,13 @@ class _MainScreenState extends State<MainScreen>
       return;
     }
 
-    // For menu links
     if (uri.path.startsWith('/menu')) {
       _switchToTab(1);
       await _loadUrlInTab(1, uri.toString());
       return;
     }
 
-    // Default → Home tab
     _switchToTab(0);
-    // For the root URL, skip WebView navigation — the home tab already has
-    // barbecuez.no loaded.  Navigating again triggers shouldOverrideUrlLoading
-    // chains (auth/cookie-consent redirects) that open SFSafariViewController,
-    // which then fires a new Universal Link and creates a Safari ↔ app loop.
     if (!isRootUrl) {
       await _loadUrlInTab(0, uri.toString());
     }
@@ -275,7 +480,6 @@ class _MainScreenState extends State<MainScreen>
     if (mounted) setState(() => _currentIndex = index);
   }
 
-  // ← NEW: Reset any tab to its original URL
   Future<void> _resetTab(int index) async {
     final controller = _webControllers[index];
     if (controller != null) {
@@ -287,8 +491,8 @@ class _MainScreenState extends State<MainScreen>
     }
   }
 
-  // Sync localStorage from Home WebView to another WebView
-  Future<void> _syncLocalStorageToController(InAppWebViewController controller) async {
+  Future<void> _syncLocalStorageToController(
+      InAppWebViewController controller) async {
     final homeController = _webControllers[0];
     if (homeController == null) return;
 
@@ -317,18 +521,14 @@ class _MainScreenState extends State<MainScreen>
             if (oldVal !== newVal) {
               try {
                 window.dispatchEvent(new StorageEvent('storage', {
-                  key: k,
-                  oldValue: oldVal,
-                  newValue: newVal,
-                  url: window.location.href,
-                  storageArea: window.localStorage
+                  key: k, oldValue: oldVal, newValue: newVal,
+                  url: window.location.href, storageArea: window.localStorage
                 }));
               } catch(e) {}
             }
           });
           window.dispatchEvent(new StorageEvent('storage', {
-            key: null,
-            url: window.location.href,
+            key: null, url: window.location.href,
             storageArea: window.localStorage
           }));
         } catch(e) {}
@@ -339,17 +539,12 @@ class _MainScreenState extends State<MainScreen>
   Future<void> _loadUrlInTab(int tabIndex, String url) async {
     final controller = _webControllers[tabIndex];
     if (controller != null) {
-      // Use JS navigation instead of loadUrl(). iOS intercepts native WKWebView
-      // load() calls to Universal Link domains and re-delivers them to the app,
-      // restarting the loop. JS-initiated navigations (window.location.href) are
-      // treated as website-initiated and do not trigger Universal Link re-delivery.
       final escaped = url.replaceAll("'", r"\'");
       try {
         await controller.evaluateJavascript(
           source: "window.location.href = '$escaped';",
         );
       } catch (_) {
-        // Fallback: WebView not ready for JS evaluation yet.
         await controller.loadUrl(urlRequest: URLRequest(url: WebUri(url)));
       }
     } else {
@@ -357,63 +552,206 @@ class _MainScreenState extends State<MainScreen>
     }
   }
 
-  // ─── OneSignal ──────────────────────────────────────────────────────────────
+  // ─── OneSignal bridge ────────────────────────────────────────────────────────
 
   Future<void> _tryFetchAndInjectPlayerId() async {
-    if (_oneSignalPlayerId != null) {
-      _playerIdRetryTimer?.cancel();
-      return;
-    }
+    if (_disposed) return;
     final id = OneSignal.User.pushSubscription.id;
     if (id != null && id.isNotEmpty) {
-      _oneSignalPlayerId = id;
+      if (_cachedPlayerId == id) {
+        _playerIdRetryTimer?.cancel();
+        return;
+      }
+      // Validate UUID format before accepting.
+      if (!_playerIdRe.hasMatch(id)) {
+        if (kDebugMode) debugPrint('[OneSignalBridge] ⚠️ Rejected malformed player_id');
+        return;
+      }
+      _cachedPlayerId = id;
       _playerIdRetryTimer?.cancel();
-      debugPrint("✅ OneSignal Player ID: $_oneSignalPlayerId");
-      await _injectPlayerIdToAllTabs();
+      if (kDebugMode) debugPrint('[OneSignalBridge] ✅ Player ID: $_cachedPlayerId');
+      await _injectPlayerIdIntoAllWebViews();
     }
   }
 
-  Future<void> _injectPlayerIdToAllTabs() async {
+  Future<void> _injectPlayerIdIntoAllWebViews() async {
+    if (_disposed) return;
     for (final controller in _webControllers) {
-      if (controller != null && _oneSignalPlayerId != null) {
-        await _injectPlayerIdToController(controller);
+      if (controller != null) {
+        await _injectPlayerIdIntoWebView(controller);
       }
     }
   }
 
-  Future<void> _injectPlayerIdToController(InAppWebViewController c) async {
-    if (_oneSignalPlayerId == null) return;
-    final script = """
-      (function() {
-        window.oneSignalPlayerId = '$_oneSignalPlayerId';
-        localStorage.setItem('customer_onesignal_player_id', '$_oneSignalPlayerId');
-        window.dispatchEvent(new CustomEvent('pushTokenReady', {
-          detail: { playerId: '$_oneSignalPlayerId', player_id: '$_oneSignalPlayerId' }
-        }));
-      })();
-    """;
-    await c.evaluateJavascript(source: script);
+  Future<void> _injectPlayerIdIntoWebView(
+      InAppWebViewController controller) async {
+    if (_disposed) return;
+
+    final playerId = _cachedPlayerId;
+    if (playerId == null || playerId.isEmpty) return;
+
+    final cid = controller.hashCode;
+    if (_injectingControllers.contains(cid)) return;
+    _injectingControllers.add(cid);
+
+    final sw = Stopwatch()..start();
+    int retries = 0;
+    bool success = false;
+
+    try {
+      final escaped =
+          playerId.replaceAll(r'\', r'\\').replaceAll("'", r"\'");
+
+      for (int attempt = 0; attempt <= _kMaxWebReadinessRetries; attempt++) {
+        if (_disposed) return;
+
+        if (attempt > 0) {
+          final ms = 200 * (1 << (attempt - 1));
+          await Future.delayed(Duration(milliseconds: ms));
+          if (_disposed) return;
+          retries++;
+        }
+
+        Map<String, dynamic>? res;
+        try {
+          final raw = await controller.evaluateJavascript(
+            source: _buildInjectionJs(escaped),
+          );
+          if (raw != null && raw != 'null' && raw.isNotEmpty) {
+            res = jsonDecode(raw.toString()) as Map<String, dynamic>?;
+          }
+        } catch (_) {
+          if (attempt < _kMaxWebReadinessRetries) continue;
+          break;
+        }
+
+        if (res == null) {
+          if (attempt < _kMaxWebReadinessRetries) continue;
+          break;
+        }
+
+        final notReady = res['notReady'] as bool? ?? false;
+        final jsOk    = res['success']  as bool? ?? false;
+
+        if (notReady) {
+          if (attempt < _kMaxWebReadinessRetries) continue;
+          break;
+        }
+        if (jsOk) {
+          success = true;
+          _lastSuccessfulInjection[cid] = DateTime.now();
+          break;
+        }
+        if (attempt < _kMaxWebReadinessRetries) continue;
+      }
+    } finally {
+      _injectingControllers.remove(cid);
+      sw.stop();
+      if (kDebugMode) {
+        debugPrint(
+          '[OneSignalBridge] ${success ? "✅" : "❌"} '
+          'cid=$cid ${sw.elapsedMilliseconds}ms retries=$retries',
+        );
+      }
+    }
   }
 
-  String? _stringDataValue(Map<String, dynamic> data, String key) {
-    final value = data[key];
-    if (value == null) return null;
-    final stringValue = value.toString();
-    return stringValue.isEmpty ? null : stringValue;
+  Future<void> _installSpaNavigationHook(
+      InAppWebViewController controller) async {
+    if (_disposed) return;
+    final escaped = (_cachedPlayerId ?? '')
+        .replaceAll(r'\', r'\\')
+        .replaceAll("'", r"\'");
+    try {
+      await controller.evaluateJavascript(
+        source: _buildSpaHookScript(escaped),
+      );
+    } catch (_) {}
   }
+
+  // ─── JS builders ─────────────────────────────────────────────────────────────
+
+  String _buildInjectionJs(String escapedId) => """
+    (function() {
+      var r = {
+        success: false, sessionStorage: false, localStorage: false,
+        playerId: null, notReady: false, error: null, url: window.location.href
+      };
+      try {
+        var pid = '$escapedId';
+        if (window.__BARBECUEZ_WEB_READY === false) {
+          r.notReady = true;
+          return JSON.stringify(r);
+        }
+        sessionStorage.setItem('customer_onesignal_player_id', pid);
+        localStorage.setItem('customer_onesignal_player_id', pid);
+        window.oneSignalPlayerId = pid;
+        window.__BARBECUEZ_PLAYER_ID = pid;
+        window.dispatchEvent(new CustomEvent('pushTokenReady',       { detail: { playerId: pid, player_id: pid } }));
+        window.dispatchEvent(new CustomEvent('nativePushTokenReady', { detail: { playerId: pid, player_id: pid, source: 'native' } }));
+        var ssVal = sessionStorage.getItem('customer_onesignal_player_id');
+        r.success = true;
+        r.sessionStorage = ssVal === pid;
+        r.localStorage   = localStorage.getItem('customer_onesignal_player_id') === pid;
+        r.playerId = pid;
+      } catch (e) {
+        r.error = String(e);
+      }
+      return JSON.stringify(r);
+    })();
+  """;
+
+  String _buildHeartbeatScript() => """
+    (function() {
+      try {
+        var ss = sessionStorage.getItem('customer_onesignal_player_id');
+        var ls = localStorage.getItem('customer_onesignal_player_id');
+        return JSON.stringify({ sessionStorage: ss, localStorage: ls });
+      } catch(e) {
+        return JSON.stringify({ sessionStorage: null, localStorage: null });
+      }
+    })();
+  """;
+
+  String _buildSpaHookScript(String escapedId) => """
+    (function(pid) {
+      window.__BARBECUEZ_PLAYER_ID = pid;
+      if (window.__BARBECUEZ_SPA_HOOK_INSTALLED) return;
+      window.__BARBECUEZ_SPA_HOOK_INSTALLED = true;
+      function onSpaNav() {
+        try {
+          var id = window.__BARBECUEZ_PLAYER_ID;
+          if (id) sessionStorage.setItem('customer_onesignal_player_id', id);
+          if (window.flutter_inappwebview) {
+            window.flutter_inappwebview
+              .callHandler('onSpaNavigation', window.location.href, id || '')
+              .catch(function(){});
+          }
+        } catch(e) {}
+      }
+      var origPush    = history.pushState;
+      var origReplace = history.replaceState;
+      history.pushState    = function() { origPush.apply(this, arguments);    try { onSpaNav(); } catch(e) {} };
+      history.replaceState = function() { origReplace.apply(this, arguments); try { onSpaNav(); } catch(e) {} };
+      window.addEventListener('popstate', function() { try { onSpaNav(); } catch(e) {} });
+    })('$escapedId');
+  """;
+
+  // ─── OneSignal (notifications + observer) ────────────────────────────────────
 
   Future<void> _initOneSignal() async {
     OneSignal.User.pushSubscription.addObserver((state) {
       final newId = state.current.id;
-      if (newId != null && newId.isNotEmpty && newId != _oneSignalPlayerId) {
-        _oneSignalPlayerId = newId;
+      if (newId != null &&
+          newId.isNotEmpty &&
+          newId != _cachedPlayerId &&
+          _playerIdRe.hasMatch(newId)) {
+        _cachedPlayerId = newId;
         _playerIdRetryTimer?.cancel();
-        _injectPlayerIdToAllTabs();
+        _injectPlayerIdIntoAllWebViews();
       }
     });
 
-    // Re-route OneSignal foreground notifications through flutter_local_notifications
-    // so they use our dismissible channel (autoCancel=true, ongoing=false).
     OneSignal.Notifications.addForegroundWillDisplayListener((event) async {
       try {
         event.preventDefault();
@@ -444,9 +782,7 @@ class _MainScreenState extends State<MainScreen>
           ),
           payload: url,
         );
-      } catch (e) {
-        debugPrint('OneSignal foreground re-display error: $e');
-      }
+      } catch (_) {}
     });
 
     OneSignal.Notifications.addClickListener((event) async {
@@ -458,7 +794,14 @@ class _MainScreenState extends State<MainScreen>
     });
   }
 
-  // ─── Firebase ───────────────────────────────────────────────────────────────
+  // ─── Firebase ────────────────────────────────────────────────────────────────
+
+  String? _stringDataValue(Map<String, dynamic> data, String key) {
+    final value = data[key];
+    if (value == null) return null;
+    final s = value.toString();
+    return s.isEmpty ? null : s;
+  }
 
   Future<void> _initFirebaseNotifications() async {
     final messaging = FirebaseMessaging.instance;
@@ -500,21 +843,17 @@ class _MainScreenState extends State<MainScreen>
 
     FirebaseMessaging.onMessageOpenedApp.listen((RemoteMessage message) async {
       final url = _stringDataValue(message.data, 'url');
-      if (url != null) {
-        await _handleIncomingLink(Uri.parse(url));
-      }
+      if (url != null) await _handleIncomingLink(Uri.parse(url));
     });
 
-    final initialMessage = await messaging.getInitialMessage();
-    if (initialMessage != null) {
-      final url = _stringDataValue(initialMessage.data, 'url');
-      if (url != null) {
-        await _handleIncomingLink(Uri.parse(url));
-      }
+    final initial = await messaging.getInitialMessage();
+    if (initial != null) {
+      final url = _stringDataValue(initial.data, 'url');
+      if (url != null) await _handleIncomingLink(Uri.parse(url));
     }
   }
 
-  // ─── Back handling ──────────────────────────────────────────────────────────
+  // ─── Back handling ───────────────────────────────────────────────────────────
 
   Future<void> _handleBackPressed() async {
     final controller = _webControllers[_currentIndex];
@@ -524,7 +863,6 @@ class _MainScreenState extends State<MainScreen>
     }
 
     if (_currentIndex != 0) {
-      _resetTab(_currentIndex); // ← Reset current tab before leaving
       setState(() => _currentIndex = 0);
       return;
     }
@@ -534,7 +872,7 @@ class _MainScreenState extends State<MainScreen>
         now.difference(_lastBackPressed!) > const Duration(seconds: 2)) {
       _lastBackPressed = now;
       Fluttertoast.showToast(
-        msg: "اضغط مرة أخرى للخروج",
+        msg: 'اضغط مرة أخرى للخروج',
         toastLength: Toast.LENGTH_SHORT,
         gravity: ToastGravity.BOTTOM,
       );
@@ -544,10 +882,11 @@ class _MainScreenState extends State<MainScreen>
     SystemNavigator.pop();
   }
 
-  // ─── Build ──────────────────────────────────────────────────────────────────
+  // ─── Build ───────────────────────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
+    super.build(context);
     SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
       statusBarColor: Colors.black,
       statusBarIconBrightness: Brightness.light,
@@ -571,16 +910,17 @@ class _MainScreenState extends State<MainScreen>
           backgroundColor: Colors.black,
           currentIndex: _currentIndex,
           onTap: (index) async {
-            // ← NEW: If tapping same tab again, reset to original URL
             if (_currentIndex == index) {
+              // Tapping the active tab resets it to its root URL.
               await _resetTab(index);
               return;
             }
-
-            // ← NEW: Reset current tab before switching to new tab
-            await _resetTab(_currentIndex);
-
+            // Switch first so the previous tab is hidden, THEN reset it.
+            // This removes the visible flash that occurred when we reset
+            // the current tab while it was still on-screen.
+            final prevIndex = _currentIndex;
             setState(() => _currentIndex = index);
+            _resetTab(prevIndex); // fire-and-forget; tab is now invisible
 
             if (index != 0) {
               final controller = _webControllers[index];
@@ -626,40 +966,57 @@ class _MainScreenState extends State<MainScreen>
             databaseEnabled: true,
             cacheEnabled: true,
             thirdPartyCookiesEnabled: true,
+            // Share the WKHTTPCookieStorage across all WKWebView instances on
+            // iOS so cookie-based consent (CookieBot, OneTrust, custom) is
+            // visible in every tab without extra sync.
+            sharedCookiesEnabled: true,
             incognito: false,
             cacheMode: CacheMode.LOAD_DEFAULT,
+            // Block drive-by malware on Android (API 27+).
+            safeBrowsingEnabled: true,
           ),
-          onWebViewCreated: (controller) {
+          onWebViewCreated: (controller) async {
+            // Clean up stale bridge state before claiming this slot.
+            final old = _webControllers[index];
+            if (old != null) _cleanupControllerState(old.hashCode);
             _webControllers[index] = controller;
 
-            // Handler 1: OneSignal Player ID
+            // Wait for the localStorage cache to finish loading from
+            // SharedPreferences before installing the preload UserScript,
+            // so the script carries the persisted consent data.
+            await _lsCacheReady;
+            await _refreshPreloadScript(controller);
+
+            // ── JS → Dart handlers ────────────────────────────────────
+            //
+            // Security: all handlers below respond to any page loaded in
+            // this controller.  External URLs are kept out of the WebView
+            // by shouldOverrideUrlLoading + onCreateWindow, so the only
+            // pages that can call these handlers are trusted barbecuez.no
+            // pages.
+
             controller.addJavaScriptHandler(
               handlerName: 'getOneSignalPlayerId',
-              callback: (_) => _oneSignalPlayerId ?? '',
+              callback: (_) => _cachedPlayerId ?? '',
             );
 
-            // Handler 2: Site requests token
             controller.addJavaScriptHandler(
               handlerName: 'getTrackingToken',
               callback: (args) async {
                 if (args.isEmpty) return null;
-                final orderNumber = args[0]?.toString() ?? '';
-                if (orderNumber.isEmpty) return null;
-                final token = await TrackingTokenStore.get(orderNumber);
-                debugPrint('🔑 getTrackingToken($orderNumber) -> ${token != null ? "FOUND" : "MISSING"}');
-                return token;
+                final order = args[0]?.toString() ?? '';
+                if (order.isEmpty) return null;
+                return TrackingTokenStore.get(order);
               },
             );
 
-            // Handler 3: Site saves new token
             controller.addJavaScriptHandler(
               handlerName: 'persistTrackingToken',
               callback: (args) async {
                 if (args.length < 2) return {'success': false};
-                final orderNumber = args[0]?.toString() ?? '';
+                final order = args[0]?.toString() ?? '';
                 final token = args[1]?.toString() ?? '';
-                await TrackingTokenStore.set(orderNumber, token);
-                debugPrint('💾 persistTrackingToken($orderNumber) saved');
+                await TrackingTokenStore.set(order, token);
                 return {'success': true};
               },
             );
@@ -754,33 +1111,59 @@ class _MainScreenState extends State<MainScreen>
             );
             // ─────────────────────────────────────────────────────────────
 
-            // Preload tokens immediately
             _injectTrackingTokens(controller);
+            _injectPlayerIdIntoWebView(controller);
           },
           onLoadStart: (controller, url) async {
-            // Early injection
-            if (controller != null) {
-              await _injectTrackingTokens(controller);
-            }
+            await _injectTrackingTokens(controller);
           },
           onLoadStop: (controller, url) async {
-            // Sync localStorage from Home tab
+            // Sync all localStorage keys from Home → this tab so auth state
+            // and cookie-consent are consistent (belt-and-suspenders alongside
+            // the AT_DOCUMENT_START preload script).
             if (index != 0) {
               await _syncLocalStorageToController(controller);
             }
-            await _injectPlayerIdToController(controller);
-            await _tryFetchAndInjectPlayerId();
+
+            // Full player-ID injection.
+            await _injectPlayerIdIntoWebView(controller);
+
+            // Patch history API for SPA route changes.
+            await _installSpaNavigationHook(controller);
+
+            // Fetch player-ID if we don't have it yet.
+            if (_cachedPlayerId == null) {
+              await _tryFetchAndInjectPlayerId();
+            }
+
             await _injectTrackingTokens(controller);
+
+            // Capture localStorage (including consent keys) into the Flutter
+            // cache and refresh the AT_DOCUMENT_START preload script so the
+            // NEXT load of any tab has consent pre-injected.
+            await _captureAndSyncLs(controller);
           },
           onCreateWindow: (controller, createWindowAction) async {
             final url = createWindowAction.request.url;
-            debugPrint('[CreateWindow] url=$url');
             if (url == null) return false;
-            // Load ALL popup URLs (internal AND external) inside the WebView.
-            // Opening external popups in SFSafariViewController creates a
-            // Universal Link loop when the auth/payment provider redirects
-            // back to barbecuez.no (Safari sees it as a new Universal Link).
-            await controller.loadUrl(urlRequest: URLRequest(url: WebUri.uri(url)));
+
+            final host = url.host.toLowerCase();
+
+            // Internal domains → load inside WebView to share cookie jar
+            // and avoid the SFSafariViewController → Universal Link loop.
+            if (_trustedHosts.contains(host)) {
+              await controller.loadUrl(
+                  urlRequest: URLRequest(url: WebUri.uri(url)));
+              return false;
+            }
+
+            // External domains (payment providers, OAuth, etc.) that open as
+            // popups also need the WebView's cookie jar for the auth/payment
+            // redirect to land back on barbecuez.no correctly.
+            // Opening in SFSafariViewController would trigger a new Universal
+            // Link delivery and break the flow.
+            await controller.loadUrl(
+                urlRequest: URLRequest(url: WebUri.uri(url)));
             return false;
           },
           onGeolocationPermissionsShowPrompt: (controller, origin) async {
@@ -793,47 +1176,48 @@ class _MainScreenState extends State<MainScreen>
           shouldOverrideUrlLoading: (controller, navigationAction) async {
             final uri = navigationAction.request.url;
             if (uri == null) return NavigationActionPolicy.ALLOW;
-            if (!navigationAction.isForMainFrame) return NavigationActionPolicy.ALLOW;
+            if (!navigationAction.isForMainFrame) {
+              return NavigationActionPolicy.ALLOW;
+            }
 
-            const internalHosts = {'barbecuez.no', 'www.barbecuez.no', 'barbecuez.lovable.app'};
-            final host = uri.host.toLowerCase();
+            final host   = uri.host.toLowerCase();
             final scheme = uri.scheme.toLowerCase();
-            debugPrint('[NavPolicy] tab=$index url=$uri host=$host scheme=$scheme');
 
-            // If Contact tab tries to navigate to an internal home page → switch to Home tab
+            if (kDebugMode) {
+              debugPrint('[NavPolicy] tab=$index url=$uri host=$host scheme=$scheme');
+            }
+
+            // Contact tab: root internal URL → switch to Home tab.
             if (index == 2) {
               final path = uri.path;
-              if ((path == '/' || path.isEmpty) && internalHosts.contains(host)) {
+              if ((path == '/' || path.isEmpty) && _trustedHosts.contains(host)) {
                 _switchToTab(0);
                 return NavigationActionPolicy.CANCEL;
               }
             }
 
-            // Native app schemes — launch directly without going through browser
-            if (['tel', 'mailto', 'whatsapp', 'sms', 'vipps', 'vippsmt'].contains(scheme)) {
-              await launchUrl(uri, mode: LaunchMode.externalNonBrowserApplication);
+            // Native app schemes.
+            if (['tel', 'mailto', 'whatsapp', 'sms', 'vipps', 'vippsmt']
+                .contains(scheme)) {
+              await launchUrl(uri,
+                  mode: LaunchMode.externalNonBrowserApplication);
               return NavigationActionPolicy.CANCEL;
             }
 
-            // Internal domains → always load inside the WebView, never via Safari
-            if (internalHosts.contains(host)) {
-              debugPrint('[NavPolicy] → ALLOW (internal)');
+            // Internal domains → always inside the WebView.
+            if (_trustedHosts.contains(host)) {
               return NavigationActionPolicy.ALLOW;
             }
 
-            // External http/https:
-            // Only open in SFSafariViewController when the user explicitly tapped
-            // a link (LINK_ACTIVATED).  Programmatic redirects — Firebase Auth,
-            // payment callbacks, cookie-consent — are allowed inside the WebView so
-            // they share the WebView cookie jar and cannot create a
-            // SFSafariViewController → Universal Link → app loop.
+            // External http/https: open in in-app browser only for explicit
+            // user taps.  Programmatic redirects (OAuth, payment callbacks)
+            // stay in the WebView to share cookies.
             if (['http', 'https'].contains(scheme)) {
-              if (navigationAction.navigationType == NavigationType.LINK_ACTIVATED) {
-                debugPrint('[NavPolicy] → CANCEL + inAppBrowserView (user link: $uri)');
+              if (navigationAction.navigationType ==
+                  NavigationType.LINK_ACTIVATED) {
                 await launchUrl(uri, mode: LaunchMode.inAppBrowserView);
                 return NavigationActionPolicy.CANCEL;
               }
-              debugPrint('[NavPolicy] → ALLOW (programmatic redirect: $uri)');
               return NavigationActionPolicy.ALLOW;
             }
 
