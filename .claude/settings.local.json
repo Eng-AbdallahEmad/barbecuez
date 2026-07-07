@@ -9,7 +9,9 @@
       "Bash(git push *)",
       "Bash(git rm *)",
       "Read(//d//**)",
-      "Bash(flutter --version)"
+      "Bash(flutter --version)",
+      "Bash(git fetch *)",
+      "Bash(git merge *)"
     ]
   }
 }
